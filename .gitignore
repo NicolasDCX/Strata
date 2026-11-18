@@ -1,0 +1,58 @@
+# Build outputs (all presets) and generated binaries
+build/
+out/
+CMakeUserPresets.json
+*.exe
+*.dll
+*.lib
+*.a
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.so
+*.dylib
+*.spv
+
+# Project-local toolchain (scripts/bootstrap-toolchain.ps1) and its logs
+.toolchain/
+aqtinstall.log
+*.log
+
+# Self-test captures and reports (--selftest <dir>)
+selftest-output/
+selftest-*/
+
+# Temporary benchmark runs (reusable scripts live in tools/Bench/scripts)
+bench-out/
+bench-results/raw/
+*.bench.txt
+
+# Personal working notes
+Prompte.txt
+
+# Credentials and local secrets
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+credentials*
+secrets*
+*.token
+
+# Editors and OS
+.vs/
+.vscode/
+.idea/
+*.user
+*.swp
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+
+# Claude Code local settings
+.claude/settings.local.json

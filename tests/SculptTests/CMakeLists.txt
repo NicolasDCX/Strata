@@ -1,0 +1,17 @@
+se_add_test(se_sculpt_tests
+    AppControllerTests.cpp
+    BrushTests.cpp
+    CompactAdjacencySculptTests.cpp
+    DenseRefitTests.cpp
+    DerivedNeighborsSculptTests.cpp
+    HistoryStagingTests.cpp
+    IncrementalConeTests.cpp
+    PagedSculptTests.cpp
+    ParallelGatherTests.cpp
+    ParallelMarkingTests.cpp
+    ParallelRegionTests.cpp
+    PrepareCommitTests.cpp
+    ParallelTests.cpp
+    StrokeTests.cpp
+    UndoTests.cpp)
+target_link_libraries(se_sculpt_tests PRIVATE se_application)

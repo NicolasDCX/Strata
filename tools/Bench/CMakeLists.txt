@@ -1,0 +1,5 @@
+add_executable(se_bench main.cpp AllocTracker.cpp)
+target_link_libraries(se_bench PRIVATE se_application se_warnings)
+if(MINGW)
+    target_link_options(se_bench PRIVATE -static)
+endif()
