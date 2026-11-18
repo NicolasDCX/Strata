@@ -1,0 +1,15 @@
+date,commit,experiment,mesh,helpers,case,metric,baseline,result,unit,config,notes
+2026-11-18,ec4c525,parallel-edit-region,84M,11,Draw dab,region walk,15.84;14.94,6.75;6.43,ms,"adjacency L11 r=0.25; baseline --region serial (pregion off)",2 interleaved rounds; hashes identical
+2026-11-18,ec4c525,parallel-edit-region,84M,11,Draw dab,dab total,33.92;31.87,25.53;25.45,ms,"adjacency L11 r=0.25",
+2026-11-18,ec4c525,parallel-edit-region,84M,11,Smooth dab,dab total,38.01;36.21,30.89;29.91,ms,"adjacency L11 r=0.25",region 13.8;13.3 -> 5.5;5.3
+2026-11-18,ec4c525,parallel-edit-region,84M,11,Move dab,dab total,23.95;23.21,14.93;14.72,ms,"adjacency L11 r=0.25",region 14.8;14.8 -> 5.7;5.6
+2026-11-18,ec4c525,parallel-edit-region,84M,11,Draw dab r=0.125,dab total,8.59;7.22,6.60;5.57,ms,"adjacency L11 r=0.125 (same footprint as 21M r=0.25)",region 3.7;3.0 -> 1.8;1.5
+2026-11-18,ec4c525,parallel-edit-region,21M,11,Draw dab,dab total,7.17;8.58,6.36;6.51,ms,"adjacency L10 r=0.25",region 3.06;3.72 -> 1.60;1.67
+2026-11-18,ec4c525,parallel-edit-region,84M,11,live Draw,dab latency p50,35.24;35.02,25.37;24.14,ms,"live L11 1 round",inputs queued max 297 -> 253;248; lock hold p50 3.5 unchanged
+2026-11-18,ec4c525,parallel-edit-region,84M,11,undo (typical),edit region before lock p50,60.45;62.29,24.66;26.61,ms,"history L11 2 cycles",undo total 90.6;97.9 -> 61.0;63.1; lock hold unchanged ~28
+2026-11-18,ec4c525,parallel-edit-region,84M,11,history run,peak commit,7.12,7.34,GiB,"history L11",stamps 160 MiB (4 B per vertex)
+2026-11-18,ec4c525,parallel-edit-region,84M,11,Vulkan self-test,dab latency p50,27.30,16.50,ms,"SculptEngine --subdivisions 11 --selftest",PASS 237 checks both; peak commit 11.84 -> 12.05 GiB
+2026-11-18,ec4c525,parallel-edit-region,0M,0,unit tests,passed,197,200,tests,"ctest release preset",
+2026-11-18,pre-git,exact-bvh-build,84M,11,startup,BVH build,16.3;16.1,1.62;2.16,s,"adjacency L11","measured before version control; adopted in ec4c525"
+2026-11-18,pre-git,exact-bvh-build,84M,0,startup,BVH build,34.6;34.3,18.1;18.0,s,"adjacency L11","measured before version control; adopted in ec4c525"
+2026-11-18,pre-git,exact-bvh-build,84M,11,startup,AppController startup,50.0,36.2,s,"live L11","measured before version control; adopted in ec4c525"

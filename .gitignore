@@ -26,7 +26,7 @@ selftest-*/
 
 # Temporary benchmark runs (reusable scripts live in tools/Bench/scripts)
 bench-out/
-bench-results/raw/
+benchmarks/raw/
 *.bench.txt
 
 # Personal working notes
