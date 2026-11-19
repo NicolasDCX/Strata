@@ -3,7 +3,9 @@
 // (StrokeProcessor::setOverlapPrepare). Each keeps its own serial loop, so the
 // vertex order, falloff weights, brush normal (summed in gather order) and
 // undo records must be bit-identical to running them one after the other, at
-// any thread count, through strokes and through undo/redo.
+// any thread count, through strokes and through undo/redo. The same holds when
+// the edit region walk and BVH leaf marking overlap them too
+// (StrokeProcessor::setOverlapRegion).
 
 #include "Application/AppController.h"
 #include "Core/JobSystem.h"
@@ -72,13 +74,14 @@ struct StrokeRun {
     std::vector<u32> picks;
     std::unique_ptr<geo::ChunkedBvh> finalBvh;
     u32 overlapped = 0;
+    u32 overlappedRegions = 0;
     u32 dabs = 0;
 };
 
 /// Draw, Smooth and Move strokes with dabs of about 25K moved vertices (above
 /// the threshold), strokes that cross earlier ones (vertices already in the
 /// undo record), then a small Draw stroke (below it).
-StrokeRun runStrokes(bool overlap, unsigned helpers)
+StrokeRun runStrokes(bool overlap, unsigned helpers, bool region = false)
 {
     geo::Mesh mesh = geo::makeIcosphere(7, 1.0f, geo::VertexOrder::Spatial);
     geo::ChunkedBvh bvh;
@@ -90,6 +93,7 @@ StrokeRun runStrokes(bool overlap, unsigned helpers)
     stroke.setParallelMarking(true);
     stroke.setParallelRegion(true);
     stroke.setOverlapPrepare(overlap);
+    stroke.setOverlapRegion(region);
     StrokeRun run;
     stroke.setCommitHooks([] {}, [&] { run.dabHashes.push_back(hashMesh(mesh)); });
     struct Plan {
@@ -115,6 +119,7 @@ StrokeRun runStrokes(bool overlap, unsigned helpers)
             stroke.update(ray(i));
         }
         run.overlapped += stroke.stats().gather.overlappedDabs;
+        run.overlappedRegions += stroke.stats().normals.overlappedRegions;
         run.dabs += stroke.stats().dabCount;
         std::optional<sculpt::StrokeDelta> delta = stroke.end();
         EXPECT_TRUE(delta.has_value());
@@ -163,12 +168,13 @@ struct HistoryRun {
     std::vector<std::unique_ptr<geo::ChunkedBvh>> trees;
 };
 
-HistoryRun runHistory(bool overlap, int helpers)
+HistoryRun runHistory(bool overlap, int helpers, bool region = false)
 {
     app::AppConfig config;
     config.sphereSubdivisions = 7;
     config.jobThreads = helpers;
     config.overlapPrepare = overlap;
+    config.overlapRegion = region;
     app::AppController controller(config);
     HistoryRun run;
     const auto snapshot = [&] {
@@ -218,6 +224,45 @@ TEST(OverlappedPrepare, UndoRedoThroughControllerMatchSerialPreparation)
     for (const int helpers : {0, 3, 11}) {
         SCOPED_TRACE(testing::Message() << helpers << " helper(s)");
         const HistoryRun overlapped = runHistory(true, helpers);
+        EXPECT_EQ(overlapped.hashes, serial.hashes);
+        EXPECT_EQ(overlapped.picks, serial.picks);
+        ASSERT_EQ(overlapped.trees.size(), serial.trees.size());
+        for (std::size_t i = 0; i < serial.trees.size(); ++i) {
+            EXPECT_TRUE(overlapped.trees[i]->sameBounds(*serial.trees[i])) << "step " << i;
+        }
+    }
+}
+
+TEST(OverlappedPrepare, OverlappedRegionMatchesSerialPreparation)
+{
+    const StrokeRun serial = runStrokes(false, 3);
+    for (const unsigned helpers : {0u, 1u, 3u, 11u}) {
+        SCOPED_TRACE(testing::Message() << helpers << " helper(s)");
+        const StrokeRun overlapped = runStrokes(true, helpers, true);
+        if (helpers > 0) {
+            EXPECT_GE(overlapped.overlappedRegions, 10u) << "the dabs must be large enough to overlap";
+            EXPECT_EQ(overlapped.overlappedRegions, overlapped.overlapped);
+        } else {
+            EXPECT_EQ(overlapped.overlappedRegions, 0u);
+        }
+        EXPECT_EQ(overlapped.dabHashes, serial.dabHashes);
+        ASSERT_EQ(overlapped.deltas.size(), serial.deltas.size());
+        for (std::size_t i = 0; i < serial.deltas.size(); ++i) {
+            EXPECT_EQ(overlapped.deltas[i].vertices, serial.deltas[i].vertices) << "stroke " << i;
+            EXPECT_TRUE(test::bitwiseEqual(overlapped.deltas[i].before, serial.deltas[i].before)) << "stroke " << i;
+            EXPECT_TRUE(test::bitwiseEqual(overlapped.deltas[i].after, serial.deltas[i].after)) << "stroke " << i;
+        }
+        EXPECT_TRUE(overlapped.finalBvh->sameBounds(*serial.finalBvh)) << "boxes or cones differ";
+        EXPECT_EQ(overlapped.picks, serial.picks);
+    }
+}
+
+TEST(OverlappedPrepare, OverlappedRegionUndoRedoThroughControllerMatchSerialPreparation)
+{
+    const HistoryRun serial = runHistory(false, 3);
+    for (const int helpers : {0, 3, 11}) {
+        SCOPED_TRACE(testing::Message() << helpers << " helper(s)");
+        const HistoryRun overlapped = runHistory(true, helpers, true);
         EXPECT_EQ(overlapped.hashes, serial.hashes);
         EXPECT_EQ(overlapped.picks, serial.picks);
         ASSERT_EQ(overlapped.trees.size(), serial.trees.size());

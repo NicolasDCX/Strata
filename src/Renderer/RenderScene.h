@@ -120,6 +120,23 @@ struct RenderScene {
     /// Vertices whose position/normal changed on the CPU and are not yet on the
     /// GPU. Filled by whoever edits the mesh; the renderer consumes and clears it.
     geo::DirtyVertexSet* pendingVertexUpdates = nullptr;
+
+    /// Latency tracing: a counter the editing side increments with each edit it
+    /// publishes, read under `meshLock` when the frame takes the pending
+    /// updates. Null: not traced.
+    const u64* meshCommitSeq = nullptr;
+};
+
+/// One frame of a latency trace (RenderStats::frameTraces). Times are
+/// steady_clock milliseconds since its epoch.
+struct FrameTrace {
+    double startMs = 0.0;     ///< startNextFrame entered (after QVulkanWindow's acquire)
+    double consumedMs = 0.0;  ///< pending vertex updates taken, under the mesh lock
+    double submittedMs = 0.0; ///< frameReady() returned: queue submit and present request issued
+    u64 commitSeq = 0;        ///< *meshCommitSeq when the updates were taken
+    u32 stalePages = 0;       ///< pages drawn older than the CPU copy
+    u32 uploadVertices = 0;
+    bool pendingWork = false; ///< uploads held back for later frames
 };
 
 /// Measurements made by the renderer, for the status bar and the self-test.
@@ -195,6 +212,14 @@ struct RenderStats {
     std::vector<u32> chunksCoarseSamples;
     std::vector<u32> chunksMissingSamples;
     std::vector<u32> evictionSamples;
+    /// With recordSamples and RenderScene::meshCommitSeq: every frame.
+    std::vector<FrameTrace> frameTraces;
+    /// With recordSamples: when the GUI thread handled each change notification
+    /// of the editing side (steady_clock ms), before it requested a frame.
+    std::vector<double> changeNoticedMs;
+    /// With recordSamples: when the window received each UpdateRequest event,
+    /// before QVulkanWindow waits for its frame slot and acquires an image.
+    std::vector<double> updateRequestMs;
 };
 
 } // namespace se::render

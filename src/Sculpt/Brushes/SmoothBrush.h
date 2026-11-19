@@ -37,6 +37,15 @@ public:
     /// Same results bit for bit; a process-wide switch for tests and benchmarks.
     static void setParallelBinning(bool enabled) noexcept;
     [[nodiscard]] static bool parallelBinning() noexcept;
+    /// Dense-mode blend of the cell averages. On (default): quadratic B-spline
+    /// weights over the 3x3x3 nearest cells, continuous in value and slope.
+    /// Off: the former trilinear blend of the 2x2x2 nearest cells, whose slope
+    /// jumps on every plane through cell centres; on a curved surface each cell
+    /// then becomes a shallow pillow with a crease along its border, and as the
+    /// grid follows the dab centre, a stroke stacks those creases into angular
+    /// bands. A process-wide switch for comparisons.
+    static void setQuadraticKernel(bool enabled) noexcept;
+    [[nodiscard]] static bool quadraticKernel() noexcept;
 
     [[nodiscard]] std::string_view name() const noexcept override { return "Smooth"; }
     [[nodiscard]] StrokeMode mode() const noexcept override { return StrokeMode::Dabs; }

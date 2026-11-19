@@ -15,6 +15,7 @@ namespace {
 
 SmoothBrush::Steps g_steps;
 std::atomic<bool> g_parallelBinning{true};
+std::atomic<bool> g_quadraticKernel{true};
 
 /// Uniform grid over the brush sphere used by the dense-mode filter.
 /// Storage lives in DabScratch: vectors[cell] = sum of positions,
@@ -125,7 +126,7 @@ void binParallel(const DabContext& ctx, const KernelGrid& grid, std::size_t cell
 float buildKernelGrid(const DabContext& ctx, KernelGrid& grid)
 {
     const float cellSize = ctx.radius * SmoothBrush::kKernelFraction;
-    // One cell of margin on each side so that the 2x2x2 neighbourhood of every
+    // One cell of margin on each side so that the 3x3x3 neighbourhood of every
     // vertex inside the brush sphere exists.
     grid.origin = ctx.center - glm::vec3(ctx.radius + cellSize);
     grid.inverseCellSize = 1.0f / cellSize;
@@ -163,11 +164,14 @@ float buildKernelGrid(const DabContext& ctx, KernelGrid& grid)
 }
 
 /// Dense mode: move each vertex along the locally averaged normal onto the
-/// locally averaged surface. "Locally averaged" is a trilinear blend of the
-/// eight nearest cell averages, weighted by how many vertices each cell holds
-/// and by how well it faces the same way as the vertex.
+/// locally averaged surface. "Locally averaged" is a blend of the nearest cell
+/// averages, weighted by how many vertices each cell holds and by how well it
+/// faces the same way as the vertex. The blend weights are quadratic B-splines
+/// over the 3x3x3 nearest cells (see SmoothBrush::setQuadraticKernel), or
+/// trilinear over the 2x2x2 nearest when that switch is off.
 void kernelPass(const DabContext& ctx, const KernelGrid& grid, float amount)
 {
+    const bool quadratic = g_quadraticKernel.load(std::memory_order_relaxed);
     const std::size_t count = ctx.vertices.size();
     const std::size_t cells = static_cast<std::size_t>(grid.cellCount());
     const auto normals = ctx.mesh.normals();
@@ -183,38 +187,66 @@ void kernelPass(const DabContext& ctx, const KernelGrid& grid, float amount)
             const glm::vec3 position = ctx.positions[vertex];
             const glm::vec3 normal = normals[vertex];
 
-            // Cell averages are samples located at cell centres.
-            const glm::vec3 local = (position - grid.origin) * grid.inverseCellSize - 0.5f;
-            const glm::vec3 base = glm::floor(local);
-            const glm::vec3 t = local - base;
-            const int x0 = static_cast<int>(base.x);
-            const int y0 = static_cast<int>(base.y);
-            const int z0 = static_cast<int>(base.z);
+            // Per axis: the first cell of the neighbourhood and the weight of
+            // each of its `taps` cells. Cell averages are samples located at
+            // cell centres.
+            int first[3];
+            float axisWeights[3][3];
+            int taps = 0;
+            if (quadratic) {
+                // Quadratic B-spline centred on each cell centre: the cell
+                // holding the vertex and its two neighbours. The weights and
+                // their slopes are continuous where the vertex changes cell.
+                taps = 3;
+                const glm::vec3 local = (position - grid.origin) * grid.inverseCellSize;
+                for (int axis = 0; axis < 3; ++axis) {
+                    const float cellCoordinate = std::floor(local[axis]);
+                    const float f = local[axis] - cellCoordinate;
+                    first[axis] = static_cast<int>(cellCoordinate) - 1;
+                    axisWeights[axis][0] = 0.5f * (1.0f - f) * (1.0f - f);
+                    axisWeights[axis][1] = 0.75f - (f - 0.5f) * (f - 0.5f);
+                    axisWeights[axis][2] = 0.5f * f * f;
+                }
+            } else {
+                taps = 2;
+                const glm::vec3 local = (position - grid.origin) * grid.inverseCellSize - 0.5f;
+                for (int axis = 0; axis < 3; ++axis) {
+                    const float cellCoordinate = std::floor(local[axis]);
+                    const float t = local[axis] - cellCoordinate;
+                    first[axis] = static_cast<int>(cellCoordinate);
+                    axisWeights[axis][0] = 1.0f - t;
+                    axisWeights[axis][1] = t;
+                }
+            }
 
             glm::vec3 positionSum(0.0f);
             glm::vec3 normalSum(0.0f);
             float weightSum = 0.0f;
-            for (int corner = 0; corner < 8; ++corner) {
-                const int dx = corner & 1;
-                const int dy = (corner >> 1) & 1;
-                const int dz = (corner >> 2) & 1;
-                const std::size_t cell = static_cast<std::size_t>(grid.index(
-                    grid.clampCoordinate(x0 + dx), grid.clampCoordinate(y0 + dy), grid.clampCoordinate(z0 + dz)));
-                const float cellCount = counts[cell];
-                if (cellCount <= 0.0f) {
-                    continue;
+            for (int dz = 0; dz < taps; ++dz) {
+                const int z = grid.clampCoordinate(first[2] + dz);
+                for (int dy = 0; dy < taps; ++dy) {
+                    const int y = grid.clampCoordinate(first[1] + dy);
+                    const float weightZY = axisWeights[2][dz] * axisWeights[1][dy];
+                    for (int dx = 0; dx < taps; ++dx) {
+                        const std::size_t cell =
+                            static_cast<std::size_t>(grid.index(grid.clampCoordinate(first[0] + dx), y, z));
+                        const float cellCount = counts[cell];
+                        if (cellCount <= 0.0f) {
+                            continue;
+                        }
+                        // dot(normal, average normal of the cell): near 1 for the same
+                        // surface, 0 or negative for a surface facing the other way.
+                        const float facing = glm::dot(normal, normalSums[cell]) / cellCount;
+                        if (facing <= 0.0f) {
+                            continue;
+                        }
+                        // times cellCount, folded into the sums below
+                        const float weight = weightZY * axisWeights[0][dx] * facing;
+                        positionSum += positionSums[cell] * weight;
+                        normalSum += normalSums[cell] * weight;
+                        weightSum += cellCount * weight;
+                    }
                 }
-                // dot(normal, average normal of the cell): near 1 for the same
-                // surface, 0 or negative for a surface facing the other way.
-                const float facing = glm::dot(normal, normalSums[cell]) / cellCount;
-                if (facing <= 0.0f) {
-                    continue;
-                }
-                const float trilinear = (dx ? t.x : 1.0f - t.x) * (dy ? t.y : 1.0f - t.y) * (dz ? t.z : 1.0f - t.z);
-                const float weight = trilinear * facing; // times cellCount, folded into the sums below
-                positionSum += positionSums[cell] * weight;
-                normalSum += normalSums[cell] * weight;
-                weightSum += cellCount * weight;
             }
 
             glm::vec3 result = position;
@@ -308,6 +340,16 @@ void SmoothBrush::setParallelBinning(bool enabled) noexcept
 bool SmoothBrush::parallelBinning() noexcept
 {
     return g_parallelBinning.load(std::memory_order_relaxed);
+}
+
+void SmoothBrush::setQuadraticKernel(bool enabled) noexcept
+{
+    g_quadraticKernel.store(enabled, std::memory_order_relaxed);
+}
+
+bool SmoothBrush::quadraticKernel() noexcept
+{
+    return g_quadraticKernel.load(std::memory_order_relaxed);
 }
 
 void SmoothBrush::apply(const DabContext& ctx) const

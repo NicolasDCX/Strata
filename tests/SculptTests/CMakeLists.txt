@@ -12,6 +12,7 @@ se_add_test(se_sculpt_tests
     OverlappedPrepareTests.cpp
     ParallelRegionTests.cpp
     SmoothBinningTests.cpp
+    SmoothKernelTests.cpp
     MoveCoalescingTests.cpp
     PrepareCommitTests.cpp
     ParallelTests.cpp

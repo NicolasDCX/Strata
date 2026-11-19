@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 namespace se::geo {
 
@@ -33,12 +34,15 @@ inline void ensureRoom(std::vector<u32>& list, std::size_t count, std::size_t ex
 }
 
 /// Per-vertex order stamps of the parallel walk (see collectParallel). All
-/// kNoStamp between calls. One array per thread, sized for the largest mesh
-/// walked on it.
+/// kNoStamp between calls. One array for the process, sized for the largest
+/// mesh walked, used by one walk at a time (g_stampMutex), so a walk may run on
+/// any thread (a helper, when it overlaps a dab's preparation) without each
+/// thread growing its own copy.
 constexpr u32 kNoStamp = 0xFFFFFFFFu;
 constexpr u32 kTaken = 0xFFFFFFFEu;    ///< one-ring vertex already listed
 constexpr u32 kRingFlag = 0x80000000u; ///< stamps below it: moved vertex indices
-thread_local std::vector<u32> t_stamps;
+std::vector<u32> t_stamps;
+std::mutex g_stampMutex;
 std::atomic<std::size_t> g_stampBytes{0};
 EditRegion::ParallelSteps g_steps;
 
@@ -110,6 +114,7 @@ void EditRegion::collectParallel(const Mesh& mesh, std::span<const VertexId> mov
     // in order, and only the earliest row's first candidate of each vertex is
     // kept. Fixed blocks of rows keep their finds in order and are joined by
     // prefix sums, so the triangles are walked once.
+    const std::scoped_lock stampLock(g_stampMutex);
     std::vector<u32>& stamps = stampsFor(mesh.vertexCount());
     u32* const stamp = stamps.data();
     const std::size_t movedCount = movedVertices.size();

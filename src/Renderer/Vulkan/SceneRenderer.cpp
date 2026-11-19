@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <numeric>
@@ -290,8 +291,22 @@ void SceneRenderer::selectChunks(const glm::mat4& viewProjection, const glm::vec
     }
 }
 
+namespace {
+
+double traceNowMs() noexcept
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+} // namespace
+
 void SceneRenderer::startNextFrame()
 {
+    const bool tracing = m_stats != nullptr && m_stats->recordSamples && m_scene->meshCommitSeq != nullptr;
+    FrameTrace trace;
+    if (tracing) {
+        trace.startMs = traceNowMs();
+    }
     const double sincePreviousFrameMs = m_sinceFrameStart.elapsedMs();
     m_sinceFrameStart.reset();
     const core::Stopwatch frameTimer;
@@ -340,6 +355,10 @@ void SceneRenderer::startNextFrame()
                 m_coarseBuffers.markDirty(*m_scene->pendingVertexUpdates);
             }
             m_scene->pendingVertexUpdates->clear();
+        }
+        if (tracing) {
+            trace.consumedMs = traceNowMs();
+            trace.commitSeq = *m_scene->meshCommitSeq;
         }
         const core::Stopwatch selectTimer;
         selectChunks(constants.viewProjection, camera.eye());
@@ -517,6 +536,13 @@ void SceneRenderer::startNextFrame()
     //    renderer asks by itself is when uploads were held back by the per-frame
     //    limit, or pages were drawn stale, and more frames are needed to catch up.
     m_window->frameReady();
+    if (tracing) {
+        trace.submittedMs = traceNowMs();
+        trace.stalePages = stalePages;
+        trace.uploadVertices = uploadedVertices;
+        trace.pendingWork = pendingWork;
+        m_stats->frameTraces.push_back(trace);
+    }
     if (pendingWork) {
         m_window->requestUpdate();
     }

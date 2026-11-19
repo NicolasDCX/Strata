@@ -3,6 +3,7 @@
 #include "Application/AppController.h"
 #include "Core/Log.h"
 #include "Editor/MainWindow.h"
+#include "Editor/ViewportWindow.h"
 #include "Editor/SelfTest.h"
 #include "Geometry/Icosphere.h"
 #include "Sculpt/Brushes/SmoothBrush.h"
@@ -107,6 +108,10 @@ int runEditor(int argc, char** argv)
         QStringLiteral("smooth-binning"),
         QStringLiteral("Smooth's kernel grid for dabs of 32K vertices or more: binned on the helper threads, each cell summed in list order (parallel, default), or on the sculpt thread (serial). Same results bit for bit."),
         QStringLiteral("parallel|serial"));
+    const QCommandLineOption smoothKernelOption(
+        QStringLiteral("smooth-kernel"),
+        QStringLiteral("Blend of Smooth's dense-mode kernel cells: quadratic B-spline over 3x3x3 cells (quadratic, default) or the former trilinear blend over 2x2x2 cells (trilinear), which leaves creases along the cell planes."),
+        QStringLiteral("quadratic|trilinear"));
     const QCommandLineOption moveUpdatesOption(
         QStringLiteral("move-updates"),
         QStringLiteral("Move updates queued behind the one being applied: apply only the newest (latest, default) or every one (all). Same final mesh, undo record and BVH; only intermediate frames are skipped."),
@@ -115,6 +120,14 @@ int runEditor(int argc, char** argv)
         QStringLiteral("dab-prepare"),
         QStringLiteral("Undo record, average normal and page staging of each dab of 16K vertices or more: at the same time on the helper threads (overlap, default), or one after the other (serial). Same results bit for bit."),
         QStringLiteral("overlap|serial"));
+    const QCommandLineOption regionOverlapOption(
+        QStringLiteral("region-overlap"),
+        QStringLiteral("With --dab-prepare overlap: also walk each dab's edit region and queue its BVH leaves during the preparation (on), or after the brush (off, default). Same results bit for bit."),
+        QStringLiteral("on|off"));
+    const QCommandLineOption frameOnCommitOption(
+        QStringLiteral("frame-on-commit"),
+        QStringLiteral("Render a frame as soon as an edit is published (on), or request one and let Qt deliver the request from its timer (off, default)."),
+        QStringLiteral("on|off"));
     const QCommandLineOption markingOption(
         QStringLiteral("marking"),
         QStringLiteral("Queue each dab's BVH leaves on the helper threads, one chunk per task (parallel, default), or on the sculpt thread (serial). Same results bit for bit."),
@@ -137,7 +150,7 @@ int runEditor(int argc, char** argv)
         QStringLiteral("recompute|reuse"));
     const QCommandLineOption scenarioOption(
         QStringLiteral("selftest-scenario"),
-        QStringLiteral("Self-test script: standard (default), pressure, history (undo/redo overlapping rendering) or move (live Move strokes at 500 inputs per second)."), QStringLiteral("name"));
+        QStringLiteral("Self-test script: standard (default), pressure, history (undo/redo overlapping rendering) move (live Move strokes at 500 inputs per second) smooth (Smooth shading close-ups, data dumps) or latency (120 Hz Draw and Smooth strokes traced from input to commit to the frame that took the edit)."), QStringLiteral("name"));
     const QCommandLineOption adjacencyOption(
         QStringLiteral("adjacency"),
         QStringLiteral("Storage of the mesh adjacency (neighbours, incident triangles): compact (16-bit offsets, about 58% of the wide size, default) or wide (u32 ids)."),
@@ -158,7 +171,10 @@ int runEditor(int argc, char** argv)
     parser.addOption(regionOption);
     parser.addOption(moveUpdatesOption);
     parser.addOption(prepareOption);
+    parser.addOption(regionOverlapOption);
+    parser.addOption(frameOnCommitOption);
     parser.addOption(smoothBinOption);
+    parser.addOption(smoothKernelOption);
     parser.addOption(historyNormalsOption);
     parser.addOption(boxRefitOption);
     parser.addOption(conesOption);
@@ -275,6 +291,16 @@ int runEditor(int argc, char** argv)
             core::logWarning("Ignoring invalid --smooth-binning value");
         }
     }
+    if (parser.isSet(smoothKernelOption)) {
+        const QString value = parser.value(smoothKernelOption).toLower();
+        if (value == QStringLiteral("quadratic")) {
+            sculpt::SmoothBrush::setQuadraticKernel(true);
+        } else if (value == QStringLiteral("trilinear")) {
+            sculpt::SmoothBrush::setQuadraticKernel(false);
+        } else {
+            core::logWarning("Ignoring invalid --smooth-kernel value");
+        }
+    }
     if (parser.isSet(moveUpdatesOption)) {
         const QString value = parser.value(moveUpdatesOption).toLower();
         if (value == QStringLiteral("latest")) {
@@ -293,6 +319,16 @@ int runEditor(int argc, char** argv)
             config.overlapPrepare = false;
         } else {
             core::logWarning("Ignoring invalid --dab-prepare value");
+        }
+    }
+    if (parser.isSet(regionOverlapOption)) {
+        const QString value = parser.value(regionOverlapOption).toLower();
+        if (value == QStringLiteral("on")) {
+            config.overlapRegion = true;
+        } else if (value == QStringLiteral("off")) {
+            config.overlapRegion = false;
+        } else {
+            core::logWarning("Ignoring invalid --region-overlap value");
         }
     }
     if (parser.isSet(markingOption)) {
@@ -421,6 +457,10 @@ int runEditor(int argc, char** argv)
         scenario = SelfTest::Scenario::History;
     } else if (parser.value(scenarioOption).toLower() == QStringLiteral("move")) {
         scenario = SelfTest::Scenario::Move;
+    } else if (parser.value(scenarioOption).toLower() == QStringLiteral("smooth")) {
+        scenario = SelfTest::Scenario::Smooth;
+    } else if (parser.value(scenarioOption).toLower() == QStringLiteral("latency")) {
+        scenario = SelfTest::Scenario::Latency;
     }
 
     QVulkanInstance vulkanInstance;
@@ -444,6 +484,14 @@ int runEditor(int argc, char** argv)
     // Vulkan instance outlive the window, whose renderer references both.
     app::AppController controller(config);
     MainWindow window(controller, vulkanInstance, renderSettings);
+    if (parser.isSet(frameOnCommitOption)) {
+        const QString value = parser.value(frameOnCommitOption).toLower();
+        if (value == QStringLiteral("on") || value == QStringLiteral("off")) {
+            window.viewport().setFrameOnEngineChange(value == QStringLiteral("on"));
+        } else {
+            core::logWarning("Ignoring invalid --frame-on-commit value");
+        }
+    }
     window.resize(1280, 800);
     window.show();
 

@@ -4,6 +4,7 @@
 #include "Core/Timer.h"
 #include "Editor/MainWindow.h"
 #include "Editor/ViewportWindow.h"
+#include "Sculpt/Brushes/SmoothBrush.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -258,6 +259,10 @@ void SelfTest::start()
         buildHistorySteps();
     } else if (m_scenario == Scenario::Move) {
         buildMoveSteps();
+    } else if (m_scenario == Scenario::Smooth) {
+        buildSmoothSteps();
+    } else if (m_scenario == Scenario::Latency) {
+        buildLatencySteps();
     } else {
         buildStandardSteps();
     }
@@ -1092,6 +1097,172 @@ u64 SelfTest::meshHash() const
     return hash;
 }
 
+void SelfTest::writeBinary(const QString& name, const void* data, std::size_t bytes) const
+{
+    QFile file(QDir(m_outputDirectory).filePath(name));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        file.write(static_cast<const char*>(data), static_cast<qint64>(bytes));
+    }
+}
+
+void SelfTest::buildSmoothSteps()
+{
+    // Fixed cameras, set once from the plain sphere so that sculpting does not
+    // move them: the whole sphere (where the strokes are drawn), a close-up of
+    // the upper-left silhouette, and a closer one.
+    auto cameras = std::make_shared<std::vector<render::OrbitCamera>>();
+    auto before = std::make_shared<std::vector<glm::vec3>>();
+    auto afterHash = std::make_shared<u64>(0);
+    static const char* const kViews[] = {"full", "close", "closer"};
+    const auto view = [this, cameras](std::size_t index) {
+        m_window.viewport().camera() = (*cameras)[index];
+        m_window.viewport().refresh();
+    };
+    const auto captureAll = [this, cameras, view](const QString& stage) {
+        std::vector<QImage> images;
+        for (std::size_t i = 0; i < cameras->size(); ++i) {
+            view(i);
+            images.push_back(capture(QStringLiteral("s_%1_%2.png").arg(stage, QString::fromLatin1(kViews[i]))));
+        }
+        view(0);
+        return images;
+    };
+    auto beforeImages = std::make_shared<std::vector<QImage>>();
+    auto afterImages = std::make_shared<std::vector<QImage>>();
+    auto referenceImages = std::make_shared<std::vector<QImage>>();
+
+    m_steps.push_back([this, cameras, before, captureAll, beforeImages] {
+        ViewportWindow& viewport = m_window.viewport();
+        const float height = static_cast<float>(viewport.height());
+        render::OrbitCamera full;
+        full.frame(m_controller.bounds());
+        render::OrbitCamera close = full;
+        close.zoom(6.0f); // distance x 0.88^6
+        close.pan(0.44f * height, 0.44f * height, height);
+        render::OrbitCamera closer = full;
+        closer.zoom(10.0f);
+        closer.pan(0.95f * height, 0.95f * height, height);
+        *cameras = {full, close, closer};
+        *before = positions();
+        *beforeImages = captureAll(QStringLiteral("1_before"));
+    });
+    auto after = std::make_shared<std::vector<glm::vec3>>();
+    auto region = std::make_shared<std::vector<u32>>(); // dumped vertices: a cap around the strokes
+    m_steps.push_back([this, view, captureAll, before, after, region, afterHash, afterImages] {
+        // Repeatable strokes in the full view, over the upper-left of the
+        // sphere: the editor's Smooth defaults (radius 0.25, strength 0.5),
+        // three passes back and forth along a diagonal.
+        view(0);
+        m_window.selectBrush(sculpt::BrushId::Smooth);
+        const sculpt::BrushSettings& settings = m_controller.activeSettings();
+        note(QStringLiteral("Smooth radius %1, strength %2").arg(static_cast<double>(settings.radius)).arg(static_cast<double>(settings.strength)));
+        // (Every point is on the sphere in the full view: a press off it would orbit.)
+        stroke(viewportPoint(0.36, 0.32), viewportPoint(0.56, 0.48), 60);
+        stroke(viewportPoint(0.56, 0.48), viewportPoint(0.36, 0.32), 60);
+        stroke(viewportPoint(0.36, 0.32), viewportPoint(0.56, 0.48), 60);
+        const app::InteractionStats stats = m_controller.stats();
+        check(m_controller.undoCount() == 3, QStringLiteral("3 Smooth strokes, one undo step each (%1)").arg(m_controller.undoCount()));
+        note(QStringLiteral("last stroke: %1 dabs, %2 vertices in the last dab").arg(stats.strokeDabCount).arg(stats.lastDabVertexCount));
+        *after = positions();
+        check(*after != *before, QStringLiteral("the strokes moved vertices"));
+        // Dump a cap around the moved vertices (with a margin), and the
+        // triangles inside it with indices into the dump.
+        glm::dvec3 centre(0.0);
+        for (std::size_t v = 0; v < after->size(); ++v) {
+            if ((*after)[v] != (*before)[v]) {
+                centre += glm::dvec3(glm::normalize((*before)[v]));
+            }
+        }
+        const glm::vec3 axis = glm::normalize(glm::vec3(centre));
+        std::vector<u32> local(after->size(), kInvalidIndex);
+        region->clear();
+        for (std::size_t v = 0; v < after->size(); ++v) {
+            if (glm::dot(glm::normalize((*before)[v]), axis) > 0.9f) { // within about 26 degrees
+                local[v] = static_cast<u32>(region->size());
+                region->push_back(static_cast<u32>(v));
+            }
+        }
+        std::vector<glm::vec3> values;
+        values.reserve(region->size());
+        for (const u32 v : *region) {
+            values.push_back((*before)[v]);
+        }
+        writeBinary(QStringLiteral("s_positions_before.bin"), values.data(), values.size() * sizeof(glm::vec3));
+        values.clear();
+        for (const u32 v : *region) {
+            values.push_back((*after)[v]);
+        }
+        writeBinary(QStringLiteral("s_positions_after.bin"), values.data(), values.size() * sizeof(glm::vec3));
+        writeBinary(QStringLiteral("s_vertex_ids.bin"), region->data(), region->size() * sizeof(u32));
+        std::vector<u32> triangles;
+        const geo::Mesh& mesh = m_controller.mesh();
+        for (u32 t = 0; t < mesh.triangleCount(); ++t) {
+            const auto& corners = mesh.triangle(t);
+            if (local[corners[0]] != kInvalidIndex && local[corners[1]] != kInvalidIndex && local[corners[2]] != kInvalidIndex) {
+                triangles.insert(triangles.end(), {local[corners[0]], local[corners[1]], local[corners[2]]});
+            }
+        }
+        writeBinary(QStringLiteral("s_indices.bin"), triangles.data(), triangles.size() * sizeof(u32));
+        {
+            const std::scoped_lock lock(m_controller.documentMutex());
+            const auto normals = m_controller.mesh().normals();
+            values.clear();
+            for (const u32 v : *region) {
+                values.push_back(normals[v]);
+            }
+            writeBinary(QStringLiteral("s_normals_incremental.bin"), values.data(), values.size() * sizeof(glm::vec3));
+        }
+        note(QStringLiteral("dumped %1 vertices and %2 triangles around the strokes").arg(region->size()).arg(triangles.size() / 3));
+        *afterHash = meshHash();
+        *afterImages = captureAll(QStringLiteral("2_after"));
+    });
+    m_steps.push_back([this, captureAll, afterImages, referenceImages, region] {
+        // Same positions, every normal recomputed by the whole-mesh reference.
+        m_controller.recomputeAllNormalsForReference();
+        {
+            const std::scoped_lock lock(m_controller.documentMutex());
+            const auto normals = m_controller.mesh().normals();
+            std::vector<glm::vec3> values;
+            for (const u32 v : *region) {
+                values.push_back(normals[v]);
+            }
+            writeBinary(QStringLiteral("s_normals_reference.bin"), values.data(), values.size() * sizeof(glm::vec3));
+        }
+        const std::vector<QImage> reference = captureAll(QStringLiteral("3_reference_normals"));
+        *referenceImages = reference;
+        for (std::size_t i = 0; i < reference.size(); ++i) {
+            note(QStringLiteral("%1 view: after vs reference normals, %2 of pixels differ")
+                     .arg(QString::fromLatin1(kViews[i])).arg(imageDifference((*afterImages)[i], reference[i]), 0, 'g', 4));
+        }
+    });
+    m_steps.push_back([this, captureAll, before, after, afterHash, beforeImages, referenceImages] {
+        for (int i = 0; i < 3; ++i) {
+            m_window.undo();
+        }
+        check(positions() == *before, QStringLiteral("undo of the 3 Smooth strokes restored every vertex exactly"));
+        // Undo recomputes only the normals around the restored vertices; the
+        // reference pass above changed the others by rounding, so recompute
+        // them all again before comparing images with the initial ones.
+        m_controller.recomputeAllNormalsForReference();
+        const std::vector<QImage> undone = captureAll(QStringLiteral("4_undone"));
+        for (std::size_t i = 0; i < undone.size(); ++i) {
+            note(QStringLiteral("%1 view: undone vs before, %2 of pixels differ")
+                     .arg(QString::fromLatin1(kViews[i])).arg(imageDifference((*beforeImages)[i], undone[i]), 0, 'g', 4));
+        }
+        for (int i = 0; i < 3; ++i) {
+            m_window.redo();
+        }
+        check(positions() == *after, QStringLiteral("redo of the 3 Smooth strokes restored every sculpted vertex exactly"));
+        m_controller.recomputeAllNormalsForReference();
+        const std::vector<QImage> redoneImages = captureAll(QStringLiteral("5_redone"));
+        for (std::size_t i = 0; i < redoneImages.size(); ++i) {
+            note(QStringLiteral("%1 view: redone vs after, both with reference normals, %2 of pixels differ")
+                     .arg(QString::fromLatin1(kViews[i])).arg(imageDifference((*referenceImages)[i], redoneImages[i]), 0, 'g', 4));
+        }
+        (void)afterHash;
+    });
+}
+
 void SelfTest::buildMoveSteps()
 {
     auto before = std::make_shared<std::vector<glm::vec3>>();
@@ -1238,6 +1409,219 @@ void SelfTest::runLiveMove(float radius, const QPointF& from, const QPointF& to,
         resumeSteps();
     });
     timer->start(kSampleIntervalMs);
+}
+
+void SelfTest::buildLatencySteps()
+{
+    m_steps.push_back([this] {
+        m_window.viewport().frameMesh();
+        capture(QStringLiteral("l01_initial.png"));
+        note(QStringLiteral("%1 triangles; clocks: steady_clock ms; the last observable event of a frame is frameReady() returning "
+                            "(QVulkanWindow has issued the queue submit and the present request; no presentation timing)")
+                 .arg(m_controller.mesh().triangleCount()));
+    });
+    m_steps.push_back([this] { runLatencyTrace(sculpt::BrushId::Draw, QStringLiteral("draw")); });
+    m_steps.push_back([this] { runLatencyTrace(sculpt::BrushId::Smooth, QStringLiteral("smooth")); });
+    m_steps.push_back([this] {
+        check(m_controller.undoCount() == 0, QStringLiteral("both traced strokes undone (%1 undo steps left)").arg(m_controller.undoCount()));
+        capture(QStringLiteral("l02_end.png"));
+    });
+}
+
+void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
+{
+    constexpr double kIntervalMs = 1000.0 / 120.0;
+    constexpr int kMoves = 240; // after the press: 2 s at 120 Hz
+    constexpr float kRadius = 0.25f;
+    constexpr double kTailMs = 300.0; // frames kept rendering after the stroke's end is applied
+    using Clock = std::chrono::steady_clock;
+    const auto nowMs = [] { return std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count(); };
+
+    holdSteps();
+    m_controller.waitUntilIdle();
+    m_window.selectBrush(brush);
+    m_controller.setRadius(kRadius);
+    sculpt::SmoothBrush::resetSteps(); // the brush's step timers are process-wide; this stroke only
+    ViewportWindow& viewport = m_window.viewport();
+
+    // A circle over the front of the model, at 0.45 of its screen radius
+    // (about 2.8 units of surface on the unit sphere: the rates stroke's 1.5
+    // per second for 2 s).
+    const QPointF centre = viewportPoint(0.5, 0.5);
+    double inside = 0.0;
+    double outside = 0.5 * viewport.width();
+    for (int i = 0; i < 30; ++i) {
+        const double mid = 0.5 * (inside + outside);
+        (m_controller.pick(viewport.rayAt(centre + QPointF(mid, 0.0))).has_value() ? inside : outside) = mid;
+    }
+    const double circle = 0.45 * inside;
+    const auto pointAt = [centre, circle](int move) {
+        const double angle = 2.0 * 3.14159265358979323846 * move / kMoves;
+        return centre + QPointF(circle * std::cos(angle), circle * std::sin(angle));
+    };
+
+    struct State {
+        std::vector<double> intendedMs; // per input (0: the press)
+        std::vector<double> sentMs;
+        double startMs = 0.0;
+        double releaseMs = 0.0;
+        double endAppliedMs = 0.0;
+        int nextMove = 1;
+        std::size_t undoBefore = 0;
+    };
+    auto state = std::make_shared<State>();
+    state->undoBefore = m_controller.undoCount();
+    viewport.setFrameSampling(true);
+    state->startMs = nowMs();
+    state->intendedMs.push_back(state->startMs);
+    state->sentMs.push_back(state->startMs);
+    viewport.pointerPress(pointAt(0), Qt::LeftButton, {});
+
+    auto* timer = new QTimer(this);
+    timer->setTimerType(Qt::PreciseTimer);
+    connect(timer, &QTimer::timeout, this, [this, timer, state, pointAt, nowMs, name, circle] {
+        ViewportWindow& view = m_window.viewport();
+        // Inputs due by now are sent in order (a late GUI thread gets them as a burst, as from the OS queue).
+        while (state->nextMove <= kMoves) {
+            const double due = state->startMs + kIntervalMs * state->nextMove;
+            if (nowMs() < due) {
+                return;
+            }
+            state->intendedMs.push_back(due);
+            state->sentMs.push_back(nowMs());
+            view.pointerMove(pointAt(state->nextMove));
+            ++state->nextMove;
+        }
+        if (state->releaseMs == 0.0) {
+            state->releaseMs = nowMs();
+            view.pointerRelease();
+            return;
+        }
+        if (state->endAppliedMs == 0.0) {
+            if (m_controller.undoCount() == state->undoBefore || m_controller.stats().queuedInputs > 0) {
+                return;
+            }
+            state->endAppliedMs = nowMs();
+        }
+        if (nowMs() < state->endAppliedMs + kTailMs) {
+            return;
+        }
+        timer->stop();
+        timer->deleteLater();
+        m_controller.waitUntilIdle();
+        view.setFrameSampling(false);
+
+        const app::InteractionStats stats = m_controller.stats();
+        const render::RenderStats& render = view.renderStats();
+        const std::vector<render::FrameTrace>& frames = render.frameTraces;
+        const double t0 = state->startMs;
+        check(stats.inputSamples.size() == state->sentMs.size(),
+              QStringLiteral("%1 trace: one input sample per sent input (%2 of %3)").arg(name).arg(stats.inputSamples.size()).arg(state->sentMs.size()));
+
+        // For each input with dabs: the first frame that took its last dab's
+        // commit and drew every visible page current.
+        std::vector<double> toCommit;
+        std::vector<double> toConsume;
+        std::vector<double> toSubmit;
+        std::vector<double> total;
+        u32 measured = 0;
+        u32 dabInputs = 0;
+        u32 olderFramesAfterCommit = 0; // frames submitted after the commit that still had older geometry
+        const QString path = QDir(m_outputDirectory).filePath(QStringLiteral("trace_%1.csv").arg(name));
+        QFile file(path);
+        const bool opened = file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
+        QTextStream out(&file);
+        out << "kind,index,intended_ms,sent_ms,queued_ms,started_ms,done_ms,dabs,commit_seq,committed_ms,frame\n";
+        std::size_t frameCursor = 0;
+        for (std::size_t i = 0; i < stats.inputSamples.size() && i < state->sentMs.size(); ++i) {
+            const auto& s = stats.inputSamples[i];
+            long long frameIndex = -1;
+            if (s.dabs > 0) {
+                ++dabInputs;
+                while (frameCursor < frames.size() &&
+                       (frames[frameCursor].commitSeq < s.commitSeq || frames[frameCursor].stalePages > 0 || frames[frameCursor].pendingWork)) {
+                    ++frameCursor;
+                }
+                if (frameCursor < frames.size()) {
+                    frameIndex = static_cast<long long>(frameCursor);
+                    const render::FrameTrace& f = frames[frameCursor];
+                    ++measured;
+                    toCommit.push_back(s.committedAtMs - s.queuedAtMs);
+                    toConsume.push_back(f.consumedMs - s.committedAtMs);
+                    toSubmit.push_back(f.submittedMs - s.committedAtMs);
+                    total.push_back(f.submittedMs - s.queuedAtMs);
+                    for (std::size_t k = 0; k < frameCursor; ++k) {
+                        if (frames[k].submittedMs > s.committedAtMs && frames[k].commitSeq < s.commitSeq) {
+                            ++olderFramesAfterCommit;
+                        }
+                    }
+                }
+            }
+            out << "input," << i << ',' << QString::number(state->intendedMs[i] - t0, 'f', 4) << ','
+                << QString::number(state->sentMs[i] - t0, 'f', 4) << ',' << QString::number(s.queuedAtMs - t0, 'f', 4) << ','
+                << QString::number(s.startedAtMs - t0, 'f', 4) << ',' << QString::number(s.doneAtMs - t0, 'f', 4) << ',' << s.dabs << ','
+                << s.commitSeq << ',' << (s.dabs > 0 ? QString::number(s.committedAtMs - t0, 'f', 4) : QString()) << ',' << frameIndex << '\n';
+        }
+        out << "kind,index,start_ms,consumed_ms,submitted_ms,commit_seq,stale_pages,pending_work,upload_vertices\n";
+        for (std::size_t k = 0; k < frames.size(); ++k) {
+            const render::FrameTrace& f = frames[k];
+            out << "frame," << k << ',' << QString::number(f.startMs - t0, 'f', 4) << ',' << QString::number(f.consumedMs - t0, 'f', 4) << ','
+                << QString::number(f.submittedMs - t0, 'f', 4) << ',' << f.commitSeq << ',' << f.stalePages << ','
+                << (f.pendingWork ? 1 : 0) << ',' << f.uploadVertices << '\n';
+        }
+        for (std::size_t k = 0; k < render.changeNoticedMs.size(); ++k) {
+            out << "notice," << k << ',' << QString::number(render.changeNoticedMs[k] - t0, 'f', 4) << '\n';
+        }
+        for (std::size_t k = 0; k < render.updateRequestMs.size(); ++k) {
+            out << "update_request," << k << ',' << QString::number(render.updateRequestMs[k] - t0, 'f', 4) << '\n';
+        }
+        out << "release,0," << QString::number(state->releaseMs - t0, 'f', 4) << '\n';
+        out << "end_applied,0," << QString::number(state->endAppliedMs - t0, 'f', 4) << '\n';
+        out.flush();
+        check(opened && file.error() == QFileDevice::NoError, QStringLiteral("%1 trace written: %2").arg(name, path));
+        check(measured == dabInputs && measured > 0,
+              QStringLiteral("%1 trace: every dab-producing input reached a frame (%2 of %3)").arg(name).arg(measured).arg(dabInputs));
+        const auto row = [](const char* label, const std::vector<double>& v) {
+            return QStringLiteral("%1 p50 %2 p95 %3 max %4").arg(QString::fromLatin1(label))
+                .arg(percentile(v, 0.5), 0, 'f', 2).arg(percentile(v, 0.95), 0, 'f', 2).arg(percentile(v, 1.0), 0, 'f', 2);
+        };
+        note(QStringLiteral("%1 trace: radius %2, circle of %3 px, %4 inputs, %5 with dabs, %6 measured, %7 frames, "
+                            "%8 frames submitted after a measured commit still had older geometry")
+                 .arg(name).arg(static_cast<double>(kRadius)).arg(circle, 0, 'f', 0).arg(stats.inputSamples.size())
+                 .arg(dabInputs).arg(measured).arg(frames.size()).arg(olderFramesAfterCommit));
+        note(QStringLiteral("  ms: %1 | %2 | %3 | %4").arg(row("queued->commit", toCommit), row("commit->frame took it", toConsume),
+                                                          row("commit->submit+present request", toSubmit), row("queued->submit", total)));
+        {
+            const sculpt::StrokeStats& st = stats.strokeStages;
+            const double n = std::max<u32>(st.dabCount, 1u);
+            note(QStringLiteral("  stage timers, ms per dab over %1 dabs: gather %2 (query %3, select %4, prepare wall %5), stage %6, brush %7, "
+                                "normals %8 (region %9, compute %10, dirty %11), publish %12, BVH %13, commit lock wait %14")
+                     .arg(st.dabCount).arg(st.gatherMs / n, 0, 'f', 2).arg(st.gather.queryMs / n, 0, 'f', 2)
+                     .arg(st.gather.selectMs / n, 0, 'f', 2).arg(st.gather.prepareWallMs / n, 0, 'f', 2).arg(st.stageMs / n, 0, 'f', 2)
+                     .arg(st.brushMs / n, 0, 'f', 2).arg(st.normalsMs / n, 0, 'f', 2).arg(st.normals.regionMs / n, 0, 'f', 2)
+                     .arg(st.normals.computeMs / n, 0, 'f', 2).arg(st.normals.dirtyMs / n, 0, 'f', 2).arg(st.publishMs / n, 0, 'f', 2)
+                     .arg(st.bvhMs / n, 0, 'f', 2).arg(st.commitWaitMs / n, 0, 'f', 2));
+            note(QStringLiteral("  per dab: %1 moved vertices, %2 affected (normals), %3 triangles; largest dab %4 vertices")
+                     .arg(static_cast<double>(st.normals.moved) / n, 0, 'f', 0).arg(static_cast<double>(st.normals.affected) / n, 0, 'f', 0)
+                     .arg(static_cast<double>(st.normals.triangles) / n, 0, 'f', 0).arg(st.maxDabVertexCount));
+        }
+        {
+            const sculpt::SmoothBrush::Steps sm = sculpt::SmoothBrush::steps();
+            if (sm.calls > 0) {
+                const double c = static_cast<double>(sm.calls);
+                note(QStringLiteral("  smooth brush per dab, ms: grid clear %1, bin %2, occupied %3, kernel %4, kernel commit %5, Laplacian %6, "
+                                    "Laplacian commit %7; %8 of %9 dabs dense, %10 binned in parallel, %11 Laplacian passes per dab")
+                         .arg(sm.ms[0] / c, 0, 'f', 3).arg(sm.ms[1] / c, 0, 'f', 3).arg(sm.ms[2] / c, 0, 'f', 3).arg(sm.ms[3] / c, 0, 'f', 3)
+                         .arg(sm.ms[4] / c, 0, 'f', 3).arg(sm.ms[5] / c, 0, 'f', 3).arg(sm.ms[6] / c, 0, 'f', 3).arg(sm.denseCalls)
+                         .arg(sm.calls).arg(sm.parallelBins).arg(static_cast<double>(sm.laplacianPasses) / c, 0, 'f', 2));
+            }
+        }
+
+        m_window.undo();
+        m_controller.waitUntilIdle();
+        resumeSteps();
+    });
+    timer->start(1);
 }
 
 void SelfTest::runOverlappedHistory(const QString& label, int steps, int cycles)

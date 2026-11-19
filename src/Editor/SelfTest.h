@@ -55,6 +55,18 @@ public:
         /// mesh after every stroke: Move depends only on the last input, so it
         /// must be the same with --move-updates all and latest.
         Move,
+        /// Smooth shading check: fixed close-up cameras captured before and
+        /// after repeatable Smooth strokes on the plain sphere, then with every
+        /// normal recomputed by the whole-mesh reference, then after undo and
+        /// redo. Writes the positions before and after, the reference and
+        /// incremental normals and the triangle indices (s_*.bin) for analysis.
+        Smooth,
+        /// Latency trace: one Draw and one Smooth stroke (radius 0.25, a
+        /// circle over the front of the model) at 120 scripted inputs per
+        /// second through the real viewport. Every dab-producing input is linked
+        /// to its dab's commit and to the first frame that took that commit's
+        /// updates; writes trace_<brush>.csv.
+        Latency,
     };
 
     SelfTest(MainWindow& window, app::AppController& controller, const QString& outputDirectory,
@@ -90,6 +102,12 @@ private:
     int applyStrongStrokes(std::vector<float>& inputs, double& bvhMs, u32& dabs, u64& coneTriangles);
     void buildHistorySteps();
     void buildMoveSteps();
+    void buildSmoothSteps();
+    void buildLatencySteps();
+    /// One traced stroke of the Latency scenario; undone afterwards.
+    void runLatencyTrace(sculpt::BrushId brush, const QString& name);
+    /// Writes `count` floats (or u32s) to <output>/<name>, prefixed by the count.
+    void writeBinary(const QString& name, const void* data, std::size_t bytes) const;
     /// One live Move stroke: `samples` inputs every 2 ms from `from` to `to`,
     /// back to their midpoint for the last 40%. Appends the mesh hash after it.
     void runLiveMove(float radius, const QPointF& from, const QPointF& to, int samples, const QString& label,

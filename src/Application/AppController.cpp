@@ -52,6 +52,7 @@ AppController::AppController(const AppConfig& config)
     m_stroke.setParallelMarking(config.parallelMarking);
     m_stroke.setParallelRegion(config.parallelRegion);
     m_stroke.setOverlapPrepare(config.overlapPrepare);
+    m_stroke.setOverlapRegion(config.overlapRegion);
     m_historyNormalsBeforeLock = config.historyNormalsBeforeLock;
     m_coalesceMoveUpdates = config.coalesceMoveUpdates;
     m_bvh.setDenseRefit(config.denseBoxRefit);
@@ -84,6 +85,9 @@ AppController::AppController(const AppConfig& config)
                                     const std::scoped_lock lock(m_publishedMutex);
                                     m_published.strokeCenter = m_stroke.lastCenter();
                                 }
+                                ++m_commitSeq;
+                                m_lastCommitMs = std::chrono::duration<double, std::milli>(
+                                                     std::chrono::steady_clock::now().time_since_epoch()).count();
                                 unlockDocument(HoldKind::Dab);
                             });
 
@@ -356,6 +360,14 @@ void AppController::enqueue(const Command& command)
     m_queueChanged.notify_one();
 }
 
+void AppController::recomputeAllNormalsForReference()
+{
+    waitUntilIdle();
+    const std::scoped_lock lock(m_documentMutex);
+    m_mesh.recomputeNormals();
+    m_dirty.markAll();
+}
+
 void AppController::waitUntilIdle()
 {
     std::unique_lock lock(m_queueMutex);
@@ -604,6 +616,10 @@ void AppController::execute(const Command& command)
         sample.startedAtMs = startedAtMs;
         sample.dabs = m_stroke.active() ? m_stroke.stats().dabCount - (command.type == Command::Type::BeginStroke ? 0 : dabsBefore) : 0;
         sample.doneAtMs = steadyNowMs();
+        if (sample.dabs > 0) {
+            sample.commitSeq = m_commitSeq; // written only on this thread
+            sample.committedAtMs = m_lastCommitMs;
+        }
         m_pendingInputs.push_back(sample);
         for (const double queuedAtMs : m_coalescedAfter) {
             dropped(queuedAtMs, sample.doneAtMs);
@@ -726,6 +742,7 @@ void AppController::publish(const Command& command, double elapsedMs)
         stats.strokeBrushMs = m_stroke.stats().brushMs;
         stats.strokeConeTriangles = m_stroke.stats().coneTriangles;
         stats.strokeRefit = m_stroke.stats().refit;
+        stats.strokeStages = m_stroke.stats();
         m_published.strokeCenter = m_stroke.lastCenter();
     }
     m_published.undoCount = m_undo.undoCount();

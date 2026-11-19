@@ -57,6 +57,7 @@ struct StrokeStats {
         u64 moved = 0;             ///< vertices the brush moved
         u64 triangles = 0;         ///< triangles with a moved corner
         u32 parallelRegions = 0;   ///< dabs whose region was walked in parallel
+        u32 overlappedRegions = 0; ///< dabs whose region walk and leaf marking overlapped the preparation
     } normals;
     double publishMs = 0.0; ///< commit: writing the new positions and normals into the mesh
     double bvhMs = 0.0;     ///< BVH refit including the chunks' normal cones: leaf marking (prepare) + the rest (commit)
@@ -147,6 +148,13 @@ public:
     void setOverlapPrepare(bool enabled) noexcept { m_overlapPrepare = enabled; }
     [[nodiscard]] bool overlapPrepare() const noexcept { return m_overlapPrepare; }
     static constexpr std::size_t kOverlapPrepareMinVertices = 16384;
+    /// When the preparation steps overlap (setOverlapPrepare), also walk the
+    /// dab's edit region and queue its BVH leaves as a fourth step at the same
+    /// time. Both need only the gathered vertices and the mesh's topology,
+    /// which nothing changes before commit, and both produce the same lists in
+    /// the same order wherever they run: same results. Off by default.
+    void setOverlapRegion(bool enabled) noexcept { m_overlapRegion = enabled; }
+    [[nodiscard]] bool overlapRegion() const noexcept { return m_overlapRegion; }
     [[nodiscard]] bool parallelRegion() const noexcept { return m_parallelRegion; }
 
     /// Called around the commit of every dab: `enter` before the first write to
@@ -218,6 +226,7 @@ private:
     void releasePages();
     [[nodiscard]] geo::PagedArrayView<glm::vec3> stagedPositions() noexcept;
     /// Prepare steps 4 (normals) and the commit.
+    void collectRegion();
     void finishEdit();
     void commit();
 
@@ -260,6 +269,8 @@ private:
     bool m_parallelMarking = false;
     bool m_parallelRegion = false;
     bool m_overlapPrepare = false;
+    bool m_overlapRegion = false;
+    bool m_regionReady = false; // this dab's region is walked and its leaves marked
     // Parallel gather scratch, reused.
     std::vector<u32> m_queryChunks;                 // chunks searched, in query order
     std::vector<std::vector<u32>> m_chunkTriangles; // per searched chunk: its triangles

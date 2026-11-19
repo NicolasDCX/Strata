@@ -91,6 +91,10 @@ u32 g_coneFallbackPercent = 50;
 bool g_parallelRegion = false;
 /// "pprep": overlap each dab's undo record, average normal and page staging (AppConfig::overlapPrepare).
 bool g_overlapPrepare = false;
+/// "oreg" / "nooreg": overlap the region walk and leaf marking with the
+/// preparation (AppConfig::overlapRegion), in every mode including rates;
+/// neither: each mode's default (the bench's: off; rates: the editor's).
+int g_overlapRegion = -1;
 bool g_measureConeLoss = false;
 float g_dabRadius = 0.25f;
 /// "mlatest": latest-wins Move updates (AppConfig::coalesceMoveUpdates) in the
@@ -100,6 +104,21 @@ bool g_moveLatest = false;
 bool g_moveAll = false;
 /// "only=move" (rates): Move strokes only.
 bool g_onlyMove = false;
+/// "only=draw" / "only=smooth" (rates): that brush only.
+bool g_onlyDraw = false;
+bool g_onlySmooth = false;
+/// "hz=R" / "rad=R" (rates): one input rate / one radius instead of all three.
+double g_rateHz = 0.0;
+float g_rateRadius = 0.0f;
+/// "reps=N" (rates): repeat each stroke N times (each undone afterwards).
+int g_rateReps = 1;
+/// "dump=DIR" (rates): write every stroke's input samples and reader frames to
+/// DIR/rate_<seq>.csv.
+std::string g_rateDump;
+/// Rate strokes run so far in this process: RATE lines carry it as seq=, since
+/// a stroke's hash is reproducible only at the same place in the sequence (see
+/// runRateStroke).
+int g_rateSeq = 0;
 
 void applyConeOptions(app::AppConfig& config)
 {
@@ -110,6 +129,9 @@ void applyConeOptions(app::AppConfig& config)
     config.reuseConeNormals = g_reuseConeNormals;
     config.parallelRegion = g_parallelRegion;
     config.overlapPrepare = g_overlapPrepare;
+    if (g_overlapRegion >= 0) {
+        config.overlapRegion = g_overlapRegion == 1;
+    }
     config.coalesceMoveUpdates = g_moveLatest;
 }
 
@@ -867,6 +889,11 @@ void runRateStroke(app::AppController& controller, sculpt::BrushId brush, float 
     std::vector<float> processBusy; // inputs that applied at least one
     std::vector<float> visible;      // applied inputs with dabs: queued to the first frame after them
     std::vector<float> visibleCover; // every input: queued to the first frame after the input that covers it
+    // Applied inputs with dabs: queued to their last dab committed. Unlike
+    // `visible`, it does not depend on where the input falls between the
+    // reader's 16.67 ms ticks: with 120 Hz input there are two such phases,
+    // so `visible` moves in steps of 8.33 ms when a dab crosses a tick.
+    std::vector<float> commit;
     u32 dabs = 0;
     u32 maxDabs = 0;
     u32 busyInputs = 0;
@@ -903,6 +930,7 @@ void runRateStroke(app::AppController& controller, sculpt::BrushId brush, float 
             if (frame < frames.size()) {
                 visible.push_back(static_cast<float>(frames[frame] - s.queuedAtMs));
             }
+            commit.push_back(static_cast<float>(s.doneAtMs - s.queuedAtMs));
         }
     }
     // An input's effect is on screen once the next applied input with dabs at
@@ -951,22 +979,277 @@ void runRateStroke(app::AppController& controller, sculpt::BrushId brush, float 
     const Spread pb = spreadOf(processBusy);
     const Spread v = spreadOf(visible);
     const Spread vc = spreadOf(visibleCover);
+    const Spread cm = spreadOf(commit);
     const Spread d = spreadOf(stats.dabSamplesMs);
     const Spread rw = spreadOf(waits);
     const Spread hold = spreadOf(stats.lockHoldSamplesMs);
-    std::printf("  RATE %s r=%.4f hz=%.0f inputs=%d dabs=%u inputs_with_dabs=%u max_dabs_per_input=%u fed_ms=%.0f drain_ms=%.0f "
+    ++g_rateSeq;
+    if (!g_rateDump.empty()) {
+        const std::string path = g_rateDump + "/rate_" + std::to_string(g_rateSeq) + ".csv";
+        if (FILE* f = std::fopen(path.c_str(), "w")) {
+            std::fprintf(f, "kind,index,queued_ms,started_ms,done_ms,dabs,coalesced\n");
+            for (std::size_t i = 0; i < stats.inputSamples.size(); ++i) {
+                const auto& s = stats.inputSamples[i];
+                std::fprintf(f, "input,%zu,%.4f,%.4f,%.4f,%u,%d\n", i, s.queuedAtMs - startMs, s.startedAtMs - startMs,
+                             s.doneAtMs - startMs, s.dabs, s.coalesced ? 1 : 0);
+            }
+            for (std::size_t i = 0; i < frames.size(); ++i) {
+                std::fprintf(f, "frame,%zu,%.4f,,,,\n", i, frames[i] - startMs);
+            }
+            std::fprintf(f, "release,0,%.4f,,,,\n", releaseMs - startMs);
+            std::fclose(f);
+        }
+    }
+    std::printf("  RATE seq=%d %s r=%.4f hz=%.0f inputs=%d dabs=%u inputs_with_dabs=%u max_dabs_per_input=%u fed_ms=%.0f drain_ms=%.0f "
                 "dabs_per_s=%.1f queued_max=%u queued_release=%u growth_per_s=%.1f verts=%u applied=%u coalesced=%u release_visible_ms=%.1f hash=%016llx | ",
-                std::string(controller.activeBrushName()).c_str(), static_cast<double>(radius), rateHz, inputs, dabs, busyInputs,
+                g_rateSeq, std::string(controller.activeBrushName()).c_str(), static_cast<double>(radius), rateHz, inputs, dabs, busyInputs,
                 maxDabs, fedMs, drainMs, dabs * 1000.0 / busyMs, maxQueued, queuedAtRelease,
                 queuedAtRelease * 1000.0 / std::max(1.0, fedMs), stats.lastDabVertexCount,
                 static_cast<u32>(stats.inputSamples.size()) - coalesced, coalesced, releaseVisibleMs,
                 static_cast<unsigned long long>(hash));
     std::printf("queue_wait %.2f/%.2f/%.2f process %.2f/%.2f/%.2f process_no_dab %.3f/%.3f/%.3f process_with_dabs %.2f/%.2f/%.2f "
-                "visible %.2f/%.2f/%.2f visible_cover %.2f/%.2f/%.2f dab %.2f/%.2f/%.2f reader_wait %.3f/%.3f hold %.3f\n",
-                w.p50, w.p95, w.max, p.p50, p.p95, p.max, pi.p50, pi.p95, pi.max, pb.p50, pb.p95, pb.max, v.p50, v.p95, v.max,
+                "commit %.2f/%.2f/%.2f visible %.2f/%.2f/%.2f visible_cover %.2f/%.2f/%.2f dab %.2f/%.2f/%.2f reader_wait %.3f/%.3f hold %.3f\n",
+                w.p50, w.p95, w.max, p.p50, p.p95, p.max, pi.p50, pi.p95, pi.max, pb.p50, pb.p95, pb.max, cm.p50, cm.p95, cm.max,
+                v.p50, v.p95, v.max,
                 vc.p50, vc.p95, vc.max, d.p50, d.p95, d.max, rw.p95, rw.max, hold.p50);
     controller.undo();
     controller.waitUntilIdle();
+}
+
+/// Smooth field dump (diagnostics): Smooth strokes on a fresh sphere, written
+/// in the format of the self-test's smooth scenario (s_*.bin) plus every dab's
+/// centre (s_dab_centers.bin), for scripts/smooth analysis. `dabs` 1 = one dab
+/// at the start point; otherwise a straight stroke along +x on the view plane.
+int runSmoothDump(int level, const char* outDir, int updates, float radius, float strength, int passes)
+{
+    geo::Mesh mesh = geo::makeIcosphere(level, 1.0f, geo::VertexOrder::Spatial);
+    geo::ChunkedBvh bvh;
+    auto jobs = std::make_unique<core::JobSystem>(11u);
+    bvh.build(mesh, geo::ChunkedBvh::kDefaultChunkTriangleShift, jobs.get(), true);
+    sculpt::StrokeProcessor stroke(mesh, bvh);
+    stroke.setJobSystem(jobs.get());
+    stroke.setParallelGather(true);
+    stroke.setParallelMarking(true);
+    stroke.setParallelRegion(true);
+    stroke.setOverlapPrepare(true);
+    std::vector<glm::vec3> centers;
+    stroke.setCommitHooks([] {}, [&] { centers.push_back(stroke.lastCenter()); });
+    const sculpt::BrushLibrary brushes;
+    sculpt::BrushSettings settings = brushes.settings(sculpt::BrushId::Smooth);
+    settings.radius = radius;
+    settings.strength = strength;
+    const auto beforeAll = mesh.positions();
+    const std::vector<glm::vec3> before(beforeAll.begin(), beforeAll.end());
+    // Rays along -z towards a point at (x, 0.35) seen from the front.
+    const auto rayAt = [](float x) { return geo::Ray{{x, 0.35f, 5.0f}, {0.0f, 0.0f, -1.0f}}; };
+    for (int pass = 0; pass < passes; ++pass) {
+        const bool forward = pass % 2 == 0;
+        const float x0 = forward ? -0.3f : 0.3f;
+        const float x1 = forward ? 0.3f : -0.3f;
+        stroke.begin(brushes.brush(sculpt::BrushId::Smooth), settings, rayAt(x0));
+        for (int i = 1; i <= updates; ++i) {
+            stroke.update(rayAt(x0 + (x1 - x0) * static_cast<float>(i) / static_cast<float>(updates)));
+        }
+        (void)stroke.end();
+    }
+    std::printf("smooth dump: level %d, radius %.3f, strength %.2f, %d pass(es) of %d updates, %zu dabs, smooth steps: %llu dense of %llu calls\n",
+                level, static_cast<double>(radius), static_cast<double>(strength), passes, updates, centers.size(),
+                static_cast<unsigned long long>(sculpt::SmoothBrush::steps().denseCalls),
+                static_cast<unsigned long long>(sculpt::SmoothBrush::steps().calls));
+
+    const auto after = mesh.positions();
+    glm::vec3 axis = glm::normalize(glm::vec3(0.0f, 0.35f, std::sqrt(1.0f - 0.35f * 0.35f)));
+    std::vector<u32> local(before.size(), kInvalidIndex);
+    std::vector<u32> region;
+    for (std::size_t v = 0; v < before.size(); ++v) {
+        if (glm::dot(glm::normalize(before[v]), axis) > 0.9f) {
+            local[v] = static_cast<u32>(region.size());
+            region.push_back(static_cast<u32>(v));
+        }
+    }
+    const auto write = [outDir](const char* name, const void* data, std::size_t bytes) {
+        const std::string path = std::string(outDir) + "/" + name;
+        if (FILE* f = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(data, 1, bytes, f);
+            std::fclose(f);
+        }
+    };
+    std::vector<glm::vec3> values;
+    for (const u32 v : region) {
+        values.push_back(before[v]);
+    }
+    write("s_positions_before.bin", values.data(), values.size() * sizeof(glm::vec3));
+    values.clear();
+    for (const u32 v : region) {
+        values.push_back(after[v]);
+    }
+    write("s_positions_after.bin", values.data(), values.size() * sizeof(glm::vec3));
+    values.clear();
+    for (const u32 v : region) {
+        values.push_back(mesh.normals()[v]);
+    }
+    write("s_normals_incremental.bin", values.data(), values.size() * sizeof(glm::vec3));
+    mesh.recomputeNormals();
+    values.clear();
+    for (const u32 v : region) {
+        values.push_back(mesh.normals()[v]);
+    }
+    write("s_normals_reference.bin", values.data(), values.size() * sizeof(glm::vec3));
+    std::vector<u32> triangles;
+    for (u32 t = 0; t < mesh.triangleCount(); ++t) {
+        const auto& c = mesh.triangle(t);
+        if (local[c[0]] != kInvalidIndex && local[c[1]] != kInvalidIndex && local[c[2]] != kInvalidIndex) {
+            triangles.insert(triangles.end(), {local[c[0]], local[c[1]], local[c[2]]});
+        }
+    }
+    write("s_indices.bin", triangles.data(), triangles.size() * sizeof(u32));
+    write("s_dab_centers.bin", centers.data(), centers.size() * sizeof(glm::vec3));
+    const float params[2] = {radius, strength};
+    write("s_params.bin", params, sizeof(params));
+    std::printf("dumped %zu vertices, %zu triangles\n", region.size(), triangles.size() / 3);
+    return 0;
+}
+
+/// Repeatability diagnostic: the rates stroke of one brush, replayed `reps`
+/// times through AppController with the same rays and no timing (each input
+/// applied before the next is queued), undone after each, as rates does.
+/// Compares every repeat with the first: per-input dab counts and centres, the
+/// undo record's vertex ids and before-positions, the final positions and
+/// normals; and the state after each undo with the startup state.
+int runRepeatDiag(int level, int helperThreads, sculpt::BrushId brush, float radius, int reps, bool refreshNormals, bool fresh)
+{
+    app::AppConfig config;
+    config.sphereSubdivisions = level;
+    config.jobThreads = helperThreads;
+    if (g_overlapRegion >= 0) {
+        config.overlapRegion = g_overlapRegion == 1;
+    }
+    auto owner = std::make_unique<app::AppController>(config);
+    std::printf("repeat diag: level %d (%u triangles), %s r=%.4f, %d reps%s, overlap region %s, %s\n", level,
+                owner->mesh().triangleCount(), brush == sculpt::BrushId::Draw ? "Draw" : brush == sculpt::BrushId::Smooth ? "Smooth" : "Move",
+                static_cast<double>(radius), reps, fresh ? " (each in a new controller)" : "", config.overlapRegion ? "on" : "off",
+                refreshNormals ? "normals recomputed (whole mesh) before each repeat" : "state left as undo leaves it");
+    owner->waitUntilIdle();
+    app::AppController* current = owner.get();
+    app::AppController& controller0 = *owner;
+    const auto bvhOrder = [](const app::AppController& c) {
+        std::vector<u32> order;
+        const geo::ChunkedBvh& bvh = c.spatialIndex();
+        for (u32 i = 0; i < bvh.chunkCount(); ++i) {
+            const auto& t = bvh.chunk(i).triangleIndices();
+            order.insert(order.end(), t.begin(), t.end());
+        }
+        return order;
+    };
+    const std::vector<u32> startOrder = bvhOrder(controller0);
+    auto& controller = *current;
+    const auto copy = [](auto span) { return std::vector<std::decay_t<decltype(span[0])>>(span.begin(), span.end()); };
+    const std::vector<glm::vec3> startPositions = copy(controller.mesh().positions());
+    const std::vector<glm::vec3> startNormals = copy(controller.mesh().normals());
+    const auto differing = [](const std::vector<glm::vec3>& a, const std::vector<glm::vec3>& b, double& maxAbs) {
+        std::size_t count = 0;
+        maxAbs = 0.0;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (std::memcmp(&a[i], &b[i], sizeof(glm::vec3)) != 0) {
+                ++count;
+                maxAbs = std::max(maxAbs, static_cast<double>(glm::length(a[i] - b[i])));
+            }
+        }
+        return count;
+    };
+    struct Rep {
+        std::vector<u32> dabsPerInput;
+        std::vector<glm::vec3> centers;
+        std::vector<u32> vertices;
+        std::vector<glm::vec3> before;
+        std::vector<glm::vec3> positions;
+        std::vector<glm::vec3> normals;
+    };
+    std::vector<Rep> runs;
+    (void)controller;
+    const float anglePerInput = 1.5f / 120.0f; // rates: surface speed 1.5 at 120 Hz
+    const float dragPerInput = 0.1f / 120.0f;
+    const bool grab = brush == sculpt::BrushId::Move;
+    controller.setActiveBrush(brush);
+    controller.setRadius(radius);
+    for (int rep = 0; rep < reps; ++rep) {
+        if (fresh && rep > 0) {
+            owner = std::make_unique<app::AppController>(config);
+            owner->waitUntilIdle();
+            owner->setActiveBrush(brush);
+            owner->setRadius(radius);
+        }
+        app::AppController& controller = *owner;
+        if (refreshNormals && rep > 0) {
+            controller.recomputeAllNormalsForReference();
+        }
+        Rep run;
+        if (!controller.beginStroke(orbitRay(0.0f, 0.0f))) {
+            std::printf("  stroke missed the mesh\n");
+            return 1;
+        }
+        controller.waitUntilIdle();
+        run.centers.push_back(controller.strokeCenter());
+        for (int i = 1; i <= 240; ++i) {
+            controller.updateStroke(grab ? orbitRay(dragPerInput * static_cast<float>(i), 0.0f)
+                                         : orbitRay(anglePerInput * static_cast<float>(i), 0.0f));
+            controller.waitUntilIdle();
+            run.centers.push_back(controller.strokeCenter());
+        }
+        controller.endStroke();
+        controller.waitUntilIdle();
+        for (const auto& s : controller.stats().inputSamples) {
+            run.dabsPerInput.push_back(s.dabs);
+        }
+        run.vertices = copy(controller.history().undoVertices());
+        run.before = copy(controller.history().undoPositions());
+        run.positions = copy(controller.mesh().positions());
+        run.normals = copy(controller.mesh().normals());
+        controller.undo();
+        controller.waitUntilIdle();
+        double maxP = 0.0;
+        double maxN = 0.0;
+        const std::size_t dp = differing(copy(controller.mesh().positions()), startPositions, maxP);
+        const std::size_t dn = differing(copy(controller.mesh().normals()), startNormals, maxN);
+        u32 dabs = 0;
+        u32 inputsWithDabs = 0;
+        for (const u32 d : run.dabsPerInput) {
+            dabs += d;
+            inputsWithDabs += d > 0 ? 1u : 0u;
+        }
+        const std::vector<u32> order = bvhOrder(controller);
+        std::size_t orderMoved = 0;
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            orderMoved += order[i] != startOrder[i] ? 1u : 0u;
+        }
+        std::printf("  rep %d: %zu inputs, %u dabs from %u inputs, %zu vertices recorded; after undo vs startup: %zu positions differ, "
+                    "%zu normals differ (max %.3g), BVH triangle order: %zu of %zu slots differ\n",
+                    rep + 1, run.dabsPerInput.size(), dabs, inputsWithDabs, run.vertices.size(), dp, dn, maxN, orderMoved, order.size());
+        if (!runs.empty()) {
+            const Rep& first = runs.front();
+            std::size_t firstCenter = run.centers.size();
+            for (std::size_t i = 0; i < std::min(run.centers.size(), first.centers.size()); ++i) {
+                if (std::memcmp(&run.centers[i], &first.centers[i], sizeof(glm::vec3)) != 0) {
+                    firstCenter = i;
+                    break;
+                }
+            }
+            double md = 0.0;
+            const std::size_t posDiff = differing(run.positions, first.positions, md);
+            double mn = 0.0;
+            const std::size_t nrmDiff = differing(run.normals, first.normals, mn);
+            double mb = 0.0;
+            const bool sameIds = run.vertices == first.vertices;
+            const std::size_t beforeDiff = sameIds ? differing(run.before, first.before, mb) : 0;
+            std::printf("         vs rep 1: dabs per input %s; first differing input centre %s; recorded vertex ids %s; "
+                        "before-positions differ %zu; final positions differ %zu (max %.3g), normals differ %zu (max %.3g)\n",
+                        run.dabsPerInput == first.dabsPerInput ? "same" : "DIFFER",
+                        firstCenter == run.centers.size() ? "none" : std::to_string(firstCenter).c_str(),
+                        sameIds ? "same" : "DIFFER", beforeDiff, posDiff, md, nrmDiff, mn);
+        }
+        runs.push_back(std::move(run));
+    }
+    return 0;
 }
 
 /// The responsiveness checkpoint: Draw, Smooth and Move at three footprints
@@ -979,6 +1262,10 @@ int runRatesBench(int level, int helperThreads, float surfaceSpeed, double frame
     if (g_moveAll || g_moveLatest) {
         config.coalesceMoveUpdates = g_moveLatest && !g_moveAll;
     }
+    if (g_overlapRegion >= 0) {
+        config.overlapRegion = g_overlapRegion == 1;
+    }
+    std::printf("region walk overlapped with the preparation: %s\n", config.overlapRegion ? "on" : "off");
     const core::Stopwatch startup;
     app::AppController controller(config);
     std::printf("rate strokes at level %d (%u triangles), %u helper thread(s), surface speed %.2f per s, frame every %.2f ms, "
@@ -986,12 +1273,21 @@ int runRatesBench(int level, int helperThreads, float surfaceSpeed, double frame
                 level, controller.mesh().triangleCount(), controller.jobThreadCount(), static_cast<double>(surfaceSpeed),
                 frameIntervalMs, controller.coalesceMoveUpdates() ? "latest" : "all", startup.elapsedMs());
     for (const sculpt::BrushId brush : {sculpt::BrushId::Draw, sculpt::BrushId::Smooth, sculpt::BrushId::Move}) {
-        if (g_onlyMove && brush != sculpt::BrushId::Move) {
+        if ((g_onlyMove && brush != sculpt::BrushId::Move) || (g_onlyDraw && brush != sculpt::BrushId::Draw) ||
+            (g_onlySmooth && brush != sculpt::BrushId::Smooth)) {
             continue;
         }
         for (const float radius : {0.0625f, 0.125f, 0.25f}) {
+            if (g_rateRadius > 0.0f && radius != g_rateRadius) {
+                continue;
+            }
             for (const double rate : {60.0, 120.0, 240.0}) {
-                runRateStroke(controller, brush, radius, rate, 2.0, surfaceSpeed, frameIntervalMs);
+                if (g_rateHz > 0.0 && rate != g_rateHz) {
+                    continue;
+                }
+                for (int rep = 0; rep < g_rateReps; ++rep) {
+                    runRateStroke(controller, brush, radius, rate, 2.0, surfaceSpeed, frameIntervalMs);
+                }
             }
         }
     }
@@ -1197,6 +1493,7 @@ int runAdjacencyBench(int level, unsigned threads, const geo::MeshLayout& layout
     stroke.setParallelMarking(parallelMarking);
     stroke.setParallelRegion(g_parallelRegion);
     stroke.setOverlapPrepare(g_overlapPrepare);
+    stroke.setOverlapRegion(g_overlapRegion == 1);
     std::printf("  gather: %s, BVH leaf marking: %s\n", parallelGather ? "parallel" : "serial",
                 parallelMarking ? "parallel" : "serial");
     const auto one = [&](const char* name, sculpt::BrushId id) {
@@ -1293,11 +1590,34 @@ int main(int argc, char** argv)
         g_reuseConeNormals = g_reuseConeNormals || std::strcmp(argv[i], "creuse") == 0;
         g_parallelRegion = g_parallelRegion || std::strcmp(argv[i], "pregion") == 0;
         g_overlapPrepare = g_overlapPrepare || std::strcmp(argv[i], "pprep") == 0;
+        if (std::strcmp(argv[i], "oreg") == 0) {
+            g_overlapRegion = 1;
+        }
+        if (std::strcmp(argv[i], "nooreg") == 0) {
+            g_overlapRegion = 0;
+        }
         g_moveLatest = g_moveLatest || std::strcmp(argv[i], "mlatest") == 0;
         g_onlyMove = g_onlyMove || std::strcmp(argv[i], "only=move") == 0;
+        g_onlyDraw = g_onlyDraw || std::strcmp(argv[i], "only=draw") == 0;
+        g_onlySmooth = g_onlySmooth || std::strcmp(argv[i], "only=smooth") == 0;
+        if (std::strncmp(argv[i], "hz=", 3) == 0) {
+            g_rateHz = std::atof(argv[i] + 3);
+        }
+        if (std::strncmp(argv[i], "rad=", 4) == 0) {
+            g_rateRadius = static_cast<float>(std::atof(argv[i] + 4));
+        }
+        if (std::strncmp(argv[i], "dump=", 5) == 0) {
+            g_rateDump = argv[i] + 5;
+        }
+        if (std::strncmp(argv[i], "reps=", 5) == 0) {
+            g_rateReps = std::max(1, std::atoi(argv[i] + 5));
+        }
         g_moveAll = g_moveAll || std::strcmp(argv[i], "mall") == 0;
         if (std::strcmp(argv[i], "sbinser") == 0) {
             sculpt::SmoothBrush::setParallelBinning(false);
+        }
+        if (std::strcmp(argv[i], "strilinear") == 0) {
+            sculpt::SmoothBrush::setQuadraticKernel(false);
         }
         if (std::strncmp(argv[i], "cfb=", 4) == 0) {
             g_coneFallbackPercent = static_cast<u32>(std::atoi(argv[i] + 4));
@@ -1314,6 +1634,7 @@ int main(int argc, char** argv)
         std::printf("parallel edit region\n");
     }
     std::printf("Smooth binning %s\n", sculpt::SmoothBrush::parallelBinning() ? "parallel" : "serial");
+    std::printf("Smooth kernel %s\n", sculpt::SmoothBrush::quadraticKernel() ? "quadratic" : "trilinear");
     if (g_overlapPrepare) {
         std::printf("overlapped dab preparation\n");
     }
@@ -1337,6 +1658,37 @@ int main(int argc, char** argv)
             parallelMarking = parallelMarking || std::strcmp(argv[i], "pmark") == 0;
         }
         return runLiveBench(level, helpers, rounds, parallelGather, parallelMarking);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "repeat") == 0) {
+        // repeat <level> <helpers> <draw|smooth|move> [radius] [reps] [refresh]
+        const int level = argc > 2 ? std::atoi(argv[2]) : 6;
+        const int helpers = argc > 3 ? std::atoi(argv[3]) : 11;
+        const std::string name = argc > 4 ? argv[4] : "draw";
+        const sculpt::BrushId id = name == "smooth" ? sculpt::BrushId::Smooth : name == "move" ? sculpt::BrushId::Move : sculpt::BrushId::Draw;
+        const float radius = argc > 5 ? static_cast<float>(std::atof(argv[5])) : 0.25f;
+        const int reps = argc > 6 ? std::atoi(argv[6]) : 3;
+        bool refresh = false;
+        for (int i = 7; i < argc; ++i) {
+            refresh = refresh || std::strcmp(argv[i], "refresh") == 0;
+        }
+        bool fresh = false;
+        for (int i = 7; i < argc; ++i) {
+            fresh = fresh || std::strcmp(argv[i], "fresh") == 0;
+        }
+        return runRepeatDiag(level, helpers, id, radius, reps, refresh, fresh);
+    }
+    if (argc > 1 && std::strcmp(argv[1], "smoothdump") == 0) {
+        // smoothdump <level> <dir> [updates] [radius] [strength] [passes] [quadratic|trilinear]
+        const int level = argc > 2 ? std::atoi(argv[2]) : 9;
+        const char* dir = argc > 3 ? argv[3] : ".";
+        const int updates = argc > 4 ? std::atoi(argv[4]) : 0;
+        const float radius = argc > 5 ? static_cast<float>(std::atof(argv[5])) : 0.25f;
+        const float strength = argc > 6 ? static_cast<float>(std::atof(argv[6])) : 0.5f;
+        const int passes = argc > 7 ? std::atoi(argv[7]) : 1;
+        if (argc > 8 && std::strcmp(argv[8], "trilinear") == 0) {
+            sculpt::SmoothBrush::setQuadraticKernel(false);
+        }
+        return runSmoothDump(level, dir, updates, radius, strength, passes);
     }
     if (argc > 1 && std::strcmp(argv[1], "rates") == 0) {
         const int level = argc > 2 ? std::atoi(argv[2]) : 10;

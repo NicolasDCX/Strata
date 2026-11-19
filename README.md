@@ -116,6 +116,8 @@ cmake --build --preset release
 | `--region <parallel\|serial>` | Edit region walk of each dab, undo and redo on the helper threads when at least 16K vertices moved (`parallel`, default; a 4-byte stamp per vertex, 160 MiB at 84M), or on the sculpt thread (`serial`). Same lists in the same order, same results bit for bit; see "Parallel edit region" |
 | `--dab-prepare <overlap\|serial>` | Undo record, average normal and page staging of each dab of 16K vertices or more: at the same time on the helper threads (`overlap`, default), or one after the other (`serial`). Same results bit for bit; see "Gather profile at 84M and overlapped dab preparation" |
 | `--move-updates <latest\|all>` | Move updates queued behind the one being applied: only the newest that changes anything is applied (`latest`, default), or every one (`all`). Same final mesh, undo record, dirty pages and (once idle) BVH and cones; only intermediate frames are skipped. See "Latest-wins Move updates" |
+| `--region-overlap <on\|off>` | With `--dab-prepare overlap`: walk each dab's edit region and queue its BVH leaves at the same time as the undo record, average normal and page staging (`on`), or after the brush (`off`, default). Same results bit for bit; see "Large-brush Draw and Smooth at 84M" |
+| `--smooth-kernel <quadratic\|trilinear>` | Blend of Smooth's dense-mode kernel cells: quadratic B-spline over 3x3x3 cells (`quadratic`, default) or the former trilinear blend over 2x2x2 cells (`trilinear`), which creases the surface along the cell planes and leaves angular bands along strokes; see "Smooth bands: kernel-cell creases" |
 | `--smooth-binning <parallel\|serial>` | Smooth's kernel grid for dabs of 32K vertices or more: binned on the helper threads, each cell summed in list order (`parallel`, default; 4 bytes per dab vertex), or on the sculpt thread (`serial`). Same results bit for bit; see "Smooth profile at 84M and parallel kernel-grid binning" |
 | `--cone-normals <reuse\|recompute>` | Exact normal cones keep each face normal of their first pass in a per-thread scratch and reuse it in the second (`reuse`, default; 64 KiB per thread), or compute it again (`recompute`). Same cones bit for bit; see "Face normals reused in exact cones" |
 | `--history-normals <before\|under>` | Undo and redo compute the new normals before taking the document lock, from the history entry's positions staged over the mesh (`before`, opt-in), or under it (`under`, default). Same results bit for bit; shorter lock hold, longer total. See "Undo and redo: normals before the lock" |
@@ -132,7 +134,8 @@ cmake --build --preset release
 | `--gpu-budget-fraction <f>` | The same budget given as a fraction of what one complete copy of the mesh needs, e.g. `0.25` |
 | `--max-upload <MiB>` | Most mesh data copied to the GPU in one frame (the initial fill of whole-mesh pools is not limited). Default 32 |
 | `--selftest <dir>` | Run the scripted smoke test, write screenshots and `report.txt` to `<dir>`, exit 0 on success |
-| `--selftest-scenario <name>` | `standard` (default), `pressure` (fixed views, camera motion, live sculpting, undo/redo; meant to run under a small budget) or `history` (repeated undo/redo of typical and strong strokes while frames render back to back; reports the renderer's lock wait, the commands' hold and total, and the scratch) |
+| `--frame-on-commit on\|off` | Render a frame as soon as an edit is published (`on`), or request one and let Qt deliver the request from its timer (`off`, default). Measured: no net latency gain; the frames then wait for the swap chain and delay input ("Input to frame in the Vulkan viewport at 84M") |
+| `--selftest-scenario <name>` | `standard` (default), `pressure` (fixed views, camera motion, live sculpting, undo/redo; meant to run under a small budget) `history` (repeated undo/redo of typical and strong strokes while frames render back to back; reports the renderer's lock wait, the commands' hold and total, and the scratch), `move`, `smooth` or `latency` (one Draw and one Smooth stroke at radius 0.25 with 120 Hz scripted input; each dab-producing input is linked to its commit and to the first frame that took it; writes `trace_draw.csv` and `trace_smooth.csv`) |
 | `--selftest-reference <dir>` | Compare the deterministic captures of this run with an earlier run in `<dir>` (only where every visible chunk is drawn) |
 
 ## Tests
@@ -1061,6 +1064,274 @@ Undo and redo (`history`, 84M, 11 helpers, typical strokes, p50 per step): the r
 **84M Vulkan standard self-test**, the two editors back to back: both PASS, 237 checks, none failed. Picking hits at the camera distance minus the radius, undo and redo restore every vertex exactly (including the strong strokes), and every cone holds its normals. Live strokes in the window, f71cb46 → this change: dab latency median 18.9 → 17.9 ms, p95 25.2 → 23.5 ms, max 29.4 → 27.9 ms; lock hold per dab median 2.78 → 2.81 ms; edit scratch 480.1 → 437.5 MiB; peak commit 12.05 → 11.94 GiB, peak working set 9.64 → 9.57 GiB. An earlier single run of the new build gave 17.8 / 23.6 / 32.0 ms.
 
 **Adopted.** The parallel walk is replaced in place (no option): with 11 helpers the region is 1.4 times faster at 84M in both rounds and for all three brushes and undo/redo, results are bit-identical, and memory goes down. At 21M the dab difference is within the noise between rounds. Without helpers nothing changes.
+
+### Input to frame in the Vulkan viewport at 84M (measured)
+
+Measured source: `cb4bf67` plus the uncommitted work. Command: `SculptEngine --subdivisions 11 --region-overlap off --selftest-scenario latency --selftest <dir>`, 3 runs.
+
+**Scenario.** One Draw stroke and one Smooth stroke at radius 0.25 go through the real viewport (`ViewportWindow::pointerMove`). Each stroke is a press plus 240 moves on a 120 Hz schedule, along a circle at 0.45 of the sphere's screen radius (about 2.8 units of surface). Each stroke is undone afterwards. Brush behaviour and defaults are unchanged.
+
+**What is stamped.** All stamps use `steady_clock`.
+- **Inputs:** enqueue time (`AppController::enqueue`).
+- **Dabs:** each dab's commit gets a sequence number and a time in the commit hook, under the document lock and just before it is released (`AppController::commitSequence()`, `InputSample::commitSeq` and `committedAtMs`).
+- **Frames:** the time the window receives each `UpdateRequest`; when `startNextFrame` is entered; when it takes the pending vertex updates under the mesh lock, together with the commit sequence it saw then; and when `frameReady()` returns.
+- **Matching:** an input's frame is the first one whose consumed sequence covers that input's last dab, with no stale pages and no held-back uploads.
+- **No presentation timing.** QVulkanWindow uses FIFO and no present-timing extension is used. The last observable event is therefore `frameReady()` returning: QVulkanWindow has issued the queue submit and `vkQueuePresentKHR` by then. Display scan-out comes later and is not measured.
+
+**Measured:** every dab-producing input. Draw: 45 per run, 135 in all. Smooth: 34 per run, 102 in all. All reached a frame.
+
+| ms, pooled over 3 runs (p50 / p95) | Draw (135 inputs) | Smooth (102 inputs) |
+|---|---|---|
+| input queued → commit (queue wait 0.01) | 21.0 / 24.1 | 32.9 / 38.4 |
+| commit → frame took the update | 10.1 / 12.9 | 9.0 / 16.4 |
+| ↳ of which notification → `UpdateRequest` | 10.0 / 12.8 | 8.8 / 16.2 |
+| ↳ of which `UpdateRequest` → `startNextFrame` | 0.05 / 0.06 | 0.04 / 0.07 |
+| frame took it → submit + present request | 2.8 / 4.1 | 2.9 / 4.1 |
+| commit → submit + present request | 13.0 / 16.1 | 11.9 / 19.5 |
+| **input queued → submit + present request** | **33.8 / 35.9** | **48.7 / 50.8** |
+
+The Draw maximum, 55.7–61.4 ms queued → commit, is the press's dab every time (first touch).
+
+**Example timelines** (run 1, ms from the press):
+- **Draw, input 23:**
+  1. queued 200.63, dab started 200.64
+  2. committed 222.16 (seq 5); the GUI thread is notified at 222.21
+  3. `UpdateRequest` and frame 9 start at 231.59; the frame takes seq 5 at 231.60
+  4. submit + present request at 234.40
+
+  Totals: 21.5 ms to commit, 9.4 ms waiting for the frame, 2.8 ms to record and submit. No frame was submitted between the commit and frame 9.
+- **Smooth, input 22:**
+  1. queued 187.81
+  2. committed 222.56 (seq 49)
+  3. frame 10 starts at 234.59 and takes seq 49
+  4. submitted at 237.50
+
+  Totals: 34.8 ms + 12.0 ms + 2.9 ms.
+- **Smooth, input 15:** frame 7 had started at 173.24, during the dab's commit. It waited 2.2 ms for the mesh lock, took the update at 175.43 (0.02 ms after the commit) and was submitted at 178.72. This happened for 6–9 of the 34 Smooth inputs per run and none of the Draw inputs.
+
+**Findings:**
+- **No frame shows older geometry after a commit.** Over the 237 inputs, no frame was submitted after a commit while still holding older geometry, and no frame had stale pages or held-back uploads. A completed edit never waits an extra frame. It waits for the next frame to be requested.
+- **Before commit is most of the delay:** 62% for Draw and 68% for Smooth at p50. The renderer's own part is 2.8–2.9 ms of recording, submit and present request.
+- **Commit to frame is a wait for the next `UpdateRequest`.**
+  - The GUI thread hears of the commit 0.1 ms later and calls `requestUpdate()`.
+  - Qt then delivers `UpdateRequest` on a fixed grid of about 15.6 ms (frame intervals p50 15.5–15.8 ms, sometimes 31 ms). Once it arrives, `startNextFrame` runs 0.05 ms later, so acquire and fence waits are negligible.
+  - The `UpdateRequest` times and the scripted input timer share the same phase modulo 15.625 ms. This is consistent with both being Qt timers on Windows' default 15.625 ms timer tick, rather than with vsync. That cause is inferred, not verified.
+  - The wait for this tick is 0–16 ms, uniform. That is the p50 of about 10 ms and the p95 of about 13–16 ms.
+- **Harness limitation.** The scripted input runs on the same Qt timer. It reaches `pointerMove` on that grid, 7.5 ms p50 (14.5 p95) after its 120 Hz schedule, often two moves at once. The table starts at enqueue, so this lag is not in it. Real mouse events arrive as window messages, not timers.
+
+**Stage timers per dab in the viewport** (`InteractionStats::strokeStages`, runs 2 and 3, ms):
+
+| | gather (query, select, prepare wall) | stage | brush | normals (region, compute, dirty) | publish | BVH |
+|---|---|---|---|---|---|---|
+| Draw | 8.5–8.6 (2.4, 3.7, 2.5) | 1.0 | 0.4 | 8.2 (4.8, 3.1, 0.4) | 1.0 | 3.6 |
+| Smooth | 9.5 (2.6, 4.0, 2.8) | 1.0 | 10.8–11.0 | 8.1–8.2 (4.4–4.5, 3.3, 0.4) | 1.1 | 3.8 |
+
+**Next experiment.** Most of the delay is before commit, so the CPU stage to target is **Smooth's brush stage**: 10.8–11.0 ms per dab, the largest single stage of either brush and a third of Smooth's input-to-commit time.
+1. Split the brush stage into its binning, kernel and apply steps, in this live trace and in `se_bench adjacency` on the same stroke. The earlier bench profile had 7.6 ms (kernel 4.5), so first find which step grows by about 3 ms in the viewport.
+2. Then shorten that step, with bit-identical results.
+
+Draw's largest stages are the gather (8.5 ms) and the serial region walk (4.8 ms), and overlapping the region walk with the preparation was already within run-to-run variation. The renderer-side 0–16 ms wait for the next `UpdateRequest` (about 10 ms p50 for both brushes) is the next candidate after that. To test it: post the `UpdateRequest` directly when a commit arrives, or raise the timer resolution, and check that commit → frame drops to the 3 ms the renderer needs.
+
+**Smooth's brush stage split** (follow-up, 2 alternating rounds at 84M).
+- **Runs:** `se_bench adjacency 11 11 pgather pmark pregion pprep nooreg`, which matches the editor's defaults, alternated with the latency scenario. The scenario now notes the per-step timers that `SmoothBrush::steps()` keeps, and the vertices per dab.
+- **Both paths are the same:** every dab is dense, binned in parallel, with one Laplacian pass.
+- **Dab size differs:** the viewport's Smooth dabs move 650,695 vertices each. That is the full cap of a 0.25 sphere on the plain unit sphere (π r² of the surface). The bench's move 555,467, because its Smooth stroke follows its own path. Hence the per-vertex column.
+
+| per dab | bench (2 runs) | viewport (2 runs) | bench ns/vertex | viewport ns/vertex |
+|---|---|---|---|---|
+| bin the vertices into the grid | 2.12 / 1.70 ms | 3.08 / 2.83 ms | 3.4 | 4.5 |
+| kernel targets (27 cells per vertex) | 4.68 / 4.53 | 5.39 / 5.30 | 8.3 | 8.2 |
+| kernel commit | 0.28 / 0.14 | 0.34 / 0.35 | 0.4 | 0.5 |
+| Laplacian targets | 1.39 / 1.21 | 1.69 / 1.69 | 2.3 | 2.6 |
+| Laplacian commit | 0.29 / 0.11 | 0.33 / 0.33 | 0.4 | 0.5 |
+| **brush stage** | **8.77 / 7.69** | **10.83 / 10.49** | **14.8** | **16.4** |
+
+Where the roughly 2.4 ms by which the viewport exceeds the bench goes:
+- **Dab size, about 1.4 ms:** the viewport's dabs hold 17% more vertices.
+- **Binning, about 0.7 ms:** it costs 32% more per vertex in the viewport. Binning streams positions and normals for every vertex, so it is the step most likely to suffer from memory or core contention. The renderer and the driver are running at the same time, but that cause is not isolated.
+- **The kernel pass is not affected:** its per-vertex cost is the same in both. It is the largest step, half of the brush stage (5.3 ms per dab, 8.2 ns per vertex), and already parallel.
+
+**Kernel pass: two variants tried, neither kept** (`se_bench adjacency 10 11 pgather pmark pregion pprep nooreg`, 21M, 3 alternating rounds; kernel ms per dab):
+
+| variant | results | kernel per dab | vs baseline |
+|---|---|---|---|
+| baseline | — | 1.23 / 1.18 / 1.24 | — |
+| cells packed into one array, clamped row offsets once per vertex | bit-identical (Draw, Smooth and Move hashes unchanged) | 1.16 / 1.23 / 1.17 (1.18 / 1.16 / 1.17 in a first set) | −3 to −5%, within run-to-run variation |
+| plus each cell's average normal computed once (no per-tap division) | **not** bit-identical (Smooth hash changes) | 1.12 / 1.07 / 1.07 | about −9% more |
+
+- **No memory bottleneck.** The grid has about 1,000 cells (about 28 KB) and stays in cache. Packing it into one array and indexing it more cheaply changes nothing measurable, so the pass is bound by its arithmetic (27 taps per vertex).
+- **Per-cell values change the results.** The only per-cell quantity the taps could share is the average normal, and moving the division into the dot product rounds differently. I was wrong earlier to say this could stay bit-identical.
+- **Small gain.** At 84M the per-cell average would save about 0.5 ms of a 5.3 ms kernel pass, about 1% of Smooth's 49 ms from input to submit.
+- **Both variants were reverted.** The kernel code, the defaults and the results are as before.
+
+**What this leaves.** The kernel pass can't be made meaningfully shorter without changing its arithmetic. A real reduction would mean fewer taps per vertex, for example a separable or 2x2x2 blend, which is a change in the brush's behaviour and needs the band checks redone. Two things remain without changing results: the binning slowdown in the viewport (0.7 ms) and the 0–16 ms wait for the next `UpdateRequest`. The second is larger and applies to every brush.
+
+**Rendering on commit** (`--frame-on-commit on|off`, default off; 2 alternating rounds at 84M, latency scenario).
+- **What `on` does:** when the GUI thread hears of a published edit, it sends the `UpdateRequest` to the window itself, so QVulkanWindow renders at once instead of at Qt's next timer delivery.
+- **Measures:**
+  - *Scheduled → submit* runs from an input's place on the 120 Hz schedule to the submit and present request. It includes the time the GUI thread takes to receive the input.
+  - The press is left out.
+
+| p50 / p95 ms, run 1 · run 2 | Draw off | Draw on | Smooth off | Smooth on |
+|---|---|---|---|---|
+| commit → frame took the edit | 9.3 / 28.4 · 9.8 / 12.4 | 6.5 / 26.3 · 4.4 / 23.0 | 6.5 / 20.3 · 9.3 / 16.0 | 0.3 / 19.3 · 1.0 / 11.7 |
+| `UpdateRequest` → `startNextFrame`, all frames | 0.06 / 27.5 · 0.05 / 0.06 | 2.1 / 27.0 · 2.3 / 26.4 | 2.3 / 34.3 · 0.04 / 0.07 | 4.2 / 26.1 · 11.9 / 15.4 |
+| input sent late vs its schedule (GUI thread busy) | 4.1 / 22.6 · 7.7 / 14.5 | 9.5 / 29.0 · 10.2 / 29.4 | 3.2 / 27.6 · 7.6 / 14.5 | 9.0 / 26.7 · 9.5 / 26.1 |
+| queued → submit | 33.4 / 52.1 · 34.1 / 35.4 | 30.0 / 51.2 · 30.1 / 48.0 | 43.2 / 59.6 · 49.2 / 50.8 | 37.0 / 53.2 · 37.2 / 49.6 |
+| **scheduled → submit** | **45.6 / 70.9 · 41.5 / 48.5** | **46.8 / 63.7 · 42.8 / 73.9** | **52.2 / 72.8 · 51.9 / 65.0** | **51.4 / 73.3 · 49.5 / 65.1** |
+
+- **The edit reaches a frame sooner.** Commit → frame p50 drops by 3–5 ms for Draw and 6–9 ms for Smooth.
+- **But the GUI thread blocks.** The extra frames now wait inside QVulkanWindow's `beginFrame`, before `startNextFrame`, for a frame slot or swap-chain image. That wait is the fence and acquire under FIFO. With `off` this wait is 0.05 ms, because Qt's ~15.6 ms timer spaces the frames out.
+- **Input arrives later.** While the GUI thread is blocked it takes in no input, so inputs reach the controller 2–3 ms later at p50 and twice as late at p95 (about 27–29 ms against 14.5 ms).
+- **No net gain.** From the input schedule to submit, the two modes are the same: Draw about 42–47 ms p50, Smooth about 50–52 ms p50, with p95 within run-to-run variation.
+- **Run-to-run variation is large.** In the first `off` run, frames already waited in `beginFrame` (27–34 ms p95), and the p95s are much worse than in the second.
+- **Verdict:** default stays off. `on` only moves the wait from Qt's timer to the swap chain.
+
+To shorten commit → frame without blocking input, a frame must not be started while every swap-chain image is still queued for presentation. Options:
+- render on commit only when the previous frame has been presented;
+- use a present mode that does not block (mailbox), if the device offers one;
+- move rendering off the GUI thread.
+
+Each needs real presentation feedback (`VK_KHR_present_wait` or similar), which is not wired in.
+
+### Rates repeatability and what "visible" measures (benchmark fix)
+
+Measured source: `cb4bf67` plus the uncommitted work.
+
+**Symptom.** Repeats of the same Draw or Smooth stroke in one `se_bench rates` run give different mesh hashes, with `--region-overlap` off as well as on. Move repeats give the same hash.
+
+**Not the input.** The k-th stroke of a run has the same hash in every process: 10 runs at 84M and 8 at 21M, overlap off and on, despite live 120 Hz pacing. Draw and Smooth inputs are never dropped and are applied in order, so input timing does not reach the geometry.
+
+**Smallest case.** `se_bench repeat 6 11 draw|smooth 0.25 3` replays the rates stroke (the same 241 rays, each applied before the next, no timing) 3 times through `AppController`, undoing after each as rates does. At level 6 (82K triangles):
+- **Undo restores the mesh.** After every undo, positions and normals equal the startup state bit for bit.
+- **Same dabs and vertices.** Every repeat emits the same dabs from the same inputs (Draw 59 from 59 inputs, Smooth 48 from 48), and its undo record holds the same vertices with the same before-positions.
+- **Different order.** The record lists those vertices in a different order. The final positions then differ by up to 1.2e-6 on about 4,200 vertices, and dab centres differ from about input 21–26 on.
+- **Overlap doesn't matter.** Overlap off and on give the same numbers.
+- **Fresh controllers agree.** With `fresh` (each repeat in a new controller), every repeat is bit-identical to the first: same dab centres, vertex ids and order, positions and normals, with overlap off and on. Identical input on an identical document gives identical geometry.
+
+**Root cause.** The BVH's triangle order is not part of what undo restores. After a stroke, the background `ChunkedBvh::optimize` re-partitions the touched blocks of each chunk from the sculpted positions (`Bvh::optimize` → `buildNode`, an unstable median split). After the undo it re-partitions them again from the restored positions, starting from the previous order. About 15K of 82K triangle slots end up in a different order than at startup, and they keep changing with each stroke and undo.
+
+The gather lists vertices in the order the sphere query visits the leaves. Draw's average normal and Smooth's binning sum over that list in order, so a different order changes the last bits. The first dab is affected straight away, and later dabs pick hits on a surface that differs by 1e-6. Move's result per vertex does not depend on the order, so its repeats agree.
+
+This is not a correctness bug: undo and redo restore positions exactly, and a given history replays identically. But a stroke's exact result depends on the acceleration structure's history as well as on the mesh.
+
+**Benchmark fix** (`tools/Bench/main.cpp`):
+- RATE lines carry `seq=`, the stroke's place in the run. Hashes are comparable between runs only at the same `seq`, and `mall` against `mlatest` and `nooreg` against `oreg` compare that way. For bit-identical repeats inside one run, use `repeat ... fresh`.
+- `repeat` mode as above.
+- `dump=DIR` writes each stroke's input samples and reader ticks to CSV.
+- A `commit` latency, from input queued to its last dab committed, for applied inputs with dabs.
+
+**What "visible" is.** `rates` has no renderer. A reader thread takes the document lock every 16.67 ms, as the renderer does to copy dirty pages, and records when it got it. "Visible" is the first such tick after an input's dab committed, minus the time the input was queued. It is a lower bound on a presented frame: no render or present time is included, and the ticks jitter by about ±3 ms.
+
+**One 84M Draw stroke** (radius 0.25, `dump=`):
+- The rays advance 0.0125 per input at 120 Hz, and dabs are 0.0625 apart (0.25 × radius). Draw's own bulge lengthens the path the rays hit, so a dab comes every 4th input (53 times) or 5th (5 times): 59 of 241 inputs emit a dab. For Smooth it is every 5th input, 48 of 241.
+- Queue wait for those inputs is 0.01 ms, and the dab takes 22 ms.
+- Inputs come every 8.33 ms, half the reader period, so a dab input arrives either about 8.3 ms after a tick or on one. Arriving 8.3 ms after a tick, the next ticks are 8.3, 25 and 41.7 ms away: a 22 ms dab is visible at 25 ms. Arriving on a tick, they are 16.7 and 33.3 ms away: the same dab is visible at 33.3 ms. Tick jitter and the reader's 16.60 ms average period add values around 17–20 ms.
+- One baseline stroke: 19–20 ms ×4, 25–26 ×30, 33–34 ×25. p50 25.5, p95 33.6.
+
+So visible p95 moves in steps of 8.33 ms, one input interval, not one frame. The "≈8 ms shift described as one frame" in "Large-brush Draw and Smooth at 84M" was one such step. Which step the p95 lands on depends on the dab time against the tick thresholds and on how many dab inputs arrive on a tick, which varies with the reader's start offset and drift. `commit` does not have these steps.
+
+**Rerun of the overlap A/B** (84M, radius 0.25, 120 Hz, 3 alternating rounds × 3 strokes, round orders base-cand, cand-base, base-cand; medians per round):
+
+| | baseline (`nooreg`) | overlapped region (`oreg`) |
+|---|---|---|
+| Draw commit p50 (ms) | 21.8 / 21.8 / 18.9 | 19.6 / 20.5 / 19.3 |
+| Draw visible p95 (ms) | 33.9 / 33.8 / 33.5 | 33.8 / 33.7 / 33.6 |
+| Smooth commit p50 (ms) | 32.5 / 32.9 (27.0 on the 3rd stroke) / 27.3 | 29.3 / 31.5 / 29.0 |
+| Smooth visible p95 (ms) | 42.2 / 42.2 / 42.1 | 42.1 / 42.0 / 42.1 |
+
+Hashes are the same per `seq` in both modes. The machine changed speed during the run: baseline Smooth dropped from 32.9 to 27.0 ms in the middle of round 2 and stayed there for round 3. In the faster state the baseline beat the overlap (Draw 18.9 vs 19.3 ms, Smooth 27.3 vs 29.0 ms). In the slower state the overlap won by 1.2–3.4 ms, as in the earlier 5 rounds.
+
+**What still holds:**
+- **Smooth band fix:** the images, crease measures and undo/redo checks don't use rates hashes. Its timings came from deterministic `adjacency` runs.
+- **Latest-wins Move:** its equal-hash checks compared the same stroke positions between modes, and Move does not depend on gather order.
+- **Overlapped region walk:** it is bit-identical (tests; `adjacency` and per-`seq` hashes).
+
+**What changes:**
+- The claim that the overlap lowered visible latency by "one frame" in rounds 1–2 is withdrawn. Those were 8.33 ms steps of a phase-dependent metric. In the rerun, visible p95 did not move in any stroke.
+- The per-dab gain (about 2 ms in the slower machine state) did not hold in the faster state, so it is within run-to-run variation. Default stays off.
+
+### Large-brush Draw and Smooth at 84M: region walk overlapped with the preparation (measured, default unchanged)
+
+Measured source: `cb4bf67` plus the uncommitted work (the Smooth band fix included). Both modes ran from one build, chosen with `oreg` / `nooreg`. Every other setting is the editor's default, with 11 helper threads.
+
+**Strokes.** `se_bench rates <L> 11 hz=120 rad=<R> reps=3` makes the checkpoint's 2 s strokes along the equator at 120 Hz: 240 inputs; at 84M, Draw makes 59 dabs and Smooth 48. Each stroke is undone afterwards. A reader takes the document lock every 16.67 ms, so "visible" is the first such frame after an input's dab commits. The `only=draw|smooth`, `hz=`, `rad=` and `reps=` filters are new. Stage timers: `se_bench adjacency <L> 11` with the editor's flags.
+
+**Baseline profile, 84M, radius 0.25** (`adjacency`, ms per dab):
+
+| | Draw (566K verts) | Smooth (572K verts) |
+|---|---|---|
+| dab | 20.7 | 25.6 |
+| gather | 8.1: query 2.4, select 3.0, undo record + average normal + staging 2.6 wall (overlapped; each is a serial loop) | 7.2 |
+| brush | 0.4 | 7.6: kernel 4.5, binning 1.6, Laplacian 1.2 |
+| affected triangles and one-ring (region walk) | 4.4 (rows 3.1) | 3.5 |
+| normals | 2.9 (31 ms CPU) | 2.7 |
+| dirty pages | 0.4 | 0.3 |
+| BVH | 3.6: leaf marking 1.3, refits and cones 2.2 | 3.4 |
+| publish | 1.0 | 0.9 |
+
+At 120 Hz neither stroke falls behind: no inputs are queued at release and the drain after release is 0 ms. Release to visible is 0.5 or 16.5 ms, depending only on where the release falls in the 60 Hz frame. Input-to-visible p95 is about 34 ms for Draw (21 ms dab + wait for the frame) and 42 ms for Smooth (31 ms dab).
+
+**Candidate** (`StrokeProcessor::setOverlapRegion`, `AppConfig::overlapRegion`, `--region-overlap on`, `se_bench oreg`). The three preparation steps overlapped at the start of each large dab are serial loops: undo record, average normal and page staging. They keep 3 threads busy for about 2.6 ms while 9 helpers wait. The region walk (affected triangles and one-ring) and the BVH leaf marking need only the gathered vertex list and the mesh's topology, so they now run as a fourth step in the same overlap, using the idle helpers through nested parallel loops.
+
+The walk's per-vertex stamp array is now one array for the process, guarded by a mutex, instead of one per thread. The walk may run on a helper, and a per-thread array would grow a 160 MiB copy on every thread that ran it. Memory is unchanged.
+
+Every dab, its order, the lists and their order are unchanged. Final positions, normals, undo records, boxes, cones and picks are bit-identical:
+- `OverlappedPrepare.OverlappedRegion*` (strokes at 0, 1, 3 and 11 helpers; undo/redo through the controller at 0, 3 and 11).
+- `adjacency` hashes at 84M (Draw `738f2233`, Smooth `7e12edab`, Move `585eba32`, same in all 6 runs) and at 21M.
+- `history 10 11 3`: the same hashes after the undo/redo cycles.
+
+**Results, 84M, radius 0.25, 120 Hz**: 5 alternating rounds of 3 strokes per brush and mode, round order base-cand, cand-base, base-cand, cand-base, base-cand. Each cell is the median of the round's 3 strokes, rounds 1–5.
+
+| | baseline | overlapped region |
+|---|---|---|
+| Draw dab p50 (ms) | 19.0 / 18.4 / 21.3 / 21.8 / 21.0 | 17.4 / 16.9 / 19.4 / 19.2 / 19.1 |
+| Draw visible p95 (ms) | 33.6 / 33.5 / 33.9 / 33.9 / 33.9 | 25.5 / 25.5 / 33.5 / 33.6 / 33.6 |
+| Smooth dab p50 (ms) | 27.1 / 27.3 / 31.1 / 32.9 / 30.9 | 25.1 / 25.2 / 29.6 / 28.9 / 29.2 |
+| Smooth visible p95 (ms) | 41.5 / 41.8 / 42.2 / 49.9 / 42.2 | 33.8 / 33.8 / 42.1 / 42.2 / 42.1 |
+| drain after release / release to visible | 0 ms / 0.5 or 16.5 ms | same |
+
+- **Per-dab time is lower in every round and in both orders.** Draw is 1.6–2.6 ms (8–12%) faster and Smooth 1.5–4.1 ms (6–12%). In `adjacency`, the normals stage drops by about 4.9 ms, and the overlapped preparation grows from 2.6 to 4.8–5.7 ms.
+- **The machine slowed down from round 3 on**, adding about 3 ms per dab in both modes. That drift between rounds is larger than the gain, which is why the comparison uses rounds that alternate the two modes.
+- **Visible latency improved by one 60 Hz frame only in rounds 1–2.** There the faster dab finished before the next frame: Draw p95 went from 33.6 to 25.5 ms, Smooth from 41.7 to 33.8 ms. In rounds 3–5 the dab still missed that frame, so p95 is unchanged. Over all 15 strokes, the median p95 is 33.9 → 33.5 ms (Draw) and 42.2 → 42.0 ms (Smooth). The stroke already finishes immediately after release in both modes.
+- **21M, radius 0.125** (34K vertices per dab, 4 rounds): visible p95 is 17.1–17.2 ms in both modes. Per-dab time has an order effect: whichever mode runs second in a round is about 0.4 ms slower, and the candidate wins one round and loses the other. No regression and no measurable gain.
+
+(Corrected in "Rates repeatability and what "visible" measures": the visible steps above are 8.33 ms phase steps, not frames, and a rerun found the per-dab gain within run-to-run variation.)
+
+**Verdict: default unchanged (off).** The CPU saving at 84M is real and bit-identical. It is smaller than the drift between runs, and it changes visible latency only when it moves a dab across a frame boundary, which happened in 2 of 5 rounds. To make large strokes visibly more responsive, a dab needs to fall clearly under a frame: about 5 ms off Draw (21 → 16 ms), more for Smooth. The largest remaining serial pieces are the average normal (2.4 ms) and undo record (1.9 ms) loops. Both are serial to keep their summation and record order, and the overlap now hides most of the region walk behind them. The next candidates are the gather's query and selection (5.4 ms, already parallel) and the normals compute (2.9 ms, about 50 ns per vertex).
+
+### Smooth bands: kernel-cell creases (fix, default)
+
+Measured source: `cb4bf67` plus the uncommitted work. Both blends ran from the same build, chosen with `--smooth-kernel` / `strilinear`.
+
+**Symptom.** On dense meshes (dense-mode dabs, 12 or more vertices per kernel cell), Smooth strokes on the sphere left broad diagonal bands with angular edges, easiest to see near the silhouette.
+
+**Reproduction.** `SculptEngine --subdivisions <9|11> --selftest-scenario smooth --selftest <dir>` uses three fixed cameras from the plain sphere: full, close (zoom 6, panned to the upper-left silhouette) and closer. It captures each view before the strokes, after three Smooth strokes at the editor defaults (radius 0.25, strength 0.5; forward, back, forward), after a full reference recomputation of the normals, after undo and after redo. It also dumps the positions, both sets of normals and the triangles around the stroke. With the close camera and a levels stretch, the bands are plainly visible after the strokes and absent before them, so the stroke creates them; it does not amplify existing faceting.
+
+**What it is not.** Incremental normals and the full reference recomputation agree within 0.04° and render identically (0 differing pixels in all three views at levels 6, 9 and 11), so shading and normals are not the cause. Undo restores every vertex exactly and redo restores the stroked state exactly.
+
+**Cause.** The dense-mode filter averages the vertices of each kernel cell (cell size 0.3 × radius), then blends the averages at each vertex. The old blend was trilinear over the 2 × 2 × 2 nearest cell centres. On a curved surface a cell's average lies below the surface, by an amount that depends on how the surface cuts the cell, and a trilinear blend has a slope jump on every plane through cell centres. A single dab therefore leaves a lattice of creases: one shallow pillow per cell, with ridges exactly on the cell-centre planes (`se_bench smoothdump` single dab, high-pass of the radial displacement with the cell planes overlaid). The grid is anchored at each dab centre and dabs are 0.25 × radius apart, so a stroke stacks a shifted lattice per dab into the angular bands. The creases follow the kernel grid, not the triangle layout.
+
+**Fix** (`SmoothBrush::setQuadraticKernel`, `--smooth-kernel quadratic`, default). The blend now uses quadratic B-spline weights over the 3 × 3 × 3 nearest cells. The weights stay continuous in value and slope where a vertex changes cell, so the blended surface has no crease. Everything else is unchanged: the count and facing weights, motion along the averaged normal, and the Laplacian pass. The grid already had the one cell of margin the wider neighbourhood needs.
+
+**Results.**
+- At level 9, the 99th percentile of the high-pass radial displacement drops 4× for one dab (7.7e-5 → 1.9e-5) and from 7.2e-5 to 4.9e-5 for three strokes. The cell lattice is gone from both maps.
+- What remains are faint straight lines along the icosphere's base-triangle edges. They appear with both blends, come from the uneven triangle sizes of the subdivided icosahedron, and are not visible in the renders.
+- `SmoothKernelTests`: one off-axis dense dab at level 8 gives a 99th-percentile discrete curvature of the displacement of 4.1e-5 (trilinear) and 7.3e-6 (quadratic).
+- The quadratic blend reaches one cell further, so a dab smooths a little more: mean depth under the brush core 7.7e-4 → 1.0e-3 for one dab, and the three-stroke trough 0.0141 → 0.0171.
+- In the matched renders at levels 9 and 11 (close view), the trilinear bands are gone.
+- The self-test passes at levels 9 and 11 with both blends: reference normals render identically, undo is exact, and redo is exact.
+
+**Cost.** `se_bench adjacency <L> 11` with the editor's flags, 2 interleaved rounds, ms per dab:
+
+| | kernel pass, trilinear → quadratic | Smooth edit, trilinear → quadratic |
+|---|---|---|
+| 21M (L10) | 0.72 / 0.69 → 1.23 / 1.22 | 6.52 / 5.82 → 7.72 / 7.35 |
+| 84M (L11) | 2.56 / 2.77 → 4.44 / 4.69 | 23.3 / 26.2 → 25.8 / 28.2 |
+
+The kernel pass reads 27 cells instead of 8 and is about 1.7 times slower: +0.5 ms per dab at 21M and +1.9 ms at 84M, about 8% of a Smooth edit. Binning and the Laplacian pass are unchanged. Each mode's mesh hash is the same in both rounds.
+
+**Adopted** as the default for correctness. `--smooth-kernel trilinear` (`strilinear` in `se_bench`) restores the old blend for comparison. A cheaper evaluation, such as per-cell normalised normals computed once per dab, is left for the performance work.
 
 ### Latest-wins Move updates (default)
 

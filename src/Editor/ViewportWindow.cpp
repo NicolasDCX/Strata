@@ -2,7 +2,10 @@
 
 #include "Renderer/Vulkan/SceneRenderer.h"
 
+#include <QCoreApplication>
 #include <QMouseEvent>
+
+#include <chrono>
 #include <QWheelEvent>
 
 namespace se::editor {
@@ -16,6 +19,7 @@ ViewportWindow::ViewportWindow(app::AppController& controller, const render::Ren
     m_scene.camera = &m_camera;
     m_scene.meshLock = &m_controller.documentMutex();
     m_scene.pendingVertexUpdates = &m_controller.pendingVertexUpdates();
+    m_scene.meshCommitSeq = &m_controller.commitSequence();
     m_camera.frame(m_controller.bounds());
 
     // Called on the sculpt thread: only hop to the GUI thread. The flag
@@ -36,8 +40,23 @@ ViewportWindow::~ViewportWindow()
 void ViewportWindow::onEngineChanged()
 {
     m_engineChangeQueued.store(false);
+    if (m_renderStats.recordSamples) {
+        m_renderStats.changeNoticedMs.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
     if (m_controller.strokeActive()) {
         m_scene.cursor.center = m_controller.strokeCenter();
+    }
+    if (m_frameOnEngineChange && isExposed()) {
+        if (m_scene.cursor.visible && !m_controller.strokeActive()) {
+            m_scene.cursor.radius = m_controller.activeSettings().radius;
+        }
+        // QVulkanWindow renders on UpdateRequest: render now rather than at
+        // the next delivery of requestUpdate().
+        QEvent request(QEvent::UpdateRequest);
+        QCoreApplication::sendEvent(this, &request);
+        emit viewportChanged();
+        return;
     }
     refresh();
 }
@@ -78,6 +97,9 @@ void ViewportWindow::setFrameSampling(bool enabled)
         m_renderStats.frameIntervalSamplesMs.clear();
         m_renderStats.lockWaitSamplesMs.clear();
         m_renderStats.uploadVertexSamples.clear();
+        m_renderStats.frameTraces.clear();
+        m_renderStats.changeNoticedMs.clear();
+        m_renderStats.updateRequestMs.clear();
     }
     m_renderStats.recordSamples = enabled;
 }
@@ -188,6 +210,15 @@ void ViewportWindow::wheelZoom(float steps)
     m_camera.zoom(steps);
     updateCursor(m_lastPosition);
     refresh();
+}
+
+bool ViewportWindow::event(QEvent* event)
+{
+    if (event->type() == QEvent::UpdateRequest && m_renderStats.recordSamples) {
+        m_renderStats.updateRequestMs.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+    return QVulkanWindow::event(event); // QVulkanWindow renders the frame from here
 }
 
 void ViewportWindow::mousePressEvent(QMouseEvent* event)

@@ -49,11 +49,17 @@ public:
     void pointerMove(const QPointF& position);
     void pointerRelease();
     void wheelZoom(float steps);
+    /// The pick ray through a window position (device independent pixels).
+    [[nodiscard]] geo::Ray rayAt(const QPointF& position) const;
 
     [[nodiscard]] render::OrbitCamera& camera() noexcept { return m_camera; }
     [[nodiscard]] const render::RenderStats& renderStats() const noexcept { return m_renderStats; }
     /// Chunk culling can be switched while running; the GPU memory settings cannot.
     void setCullMode(render::CullMode mode);
+    /// On: render a frame as soon as the GUI thread hears of an engine change
+    /// (an UpdateRequest sent directly), instead of requestUpdate(), which Qt
+    /// delivers from a timer. Off (default): requestUpdate().
+    void setFrameOnEngineChange(bool enabled) noexcept { m_frameOnEngineChange = enabled; }
     /// Measurement only: draws the scene this many times per frame (RenderSettings::drawRepeat).
     void setDrawRepeat(u32 repeat) { m_scene.settings.drawRepeat = repeat; }
     /// PROTOTYPE seam test: 0 off, 1 odd chunks coarse, 2 all chunks coarse (RenderSettings::coarseDebug).
@@ -88,11 +94,12 @@ protected:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
+    /// Stamps update requests while frames are sampled (latency tracing).
+    bool event(QEvent* event) override;
 
 private:
     enum class Interaction { None, Sculpt, Orbit, Pan };
 
-    [[nodiscard]] geo::Ray rayAt(const QPointF& position) const;
     void updateCursor(const QPointF& position);
     /// Runs on the GUI thread after the sculpt thread changed something.
     void onEngineChanged();
@@ -107,6 +114,7 @@ private:
     Qt::MouseButton m_activeButton = Qt::NoButton;
     QPointF m_lastPosition;
     std::atomic<bool> m_engineChangeQueued{false};
+    bool m_frameOnEngineChange = false;
 };
 
 } // namespace se::editor

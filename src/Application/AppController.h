@@ -57,6 +57,9 @@ struct AppConfig {
     /// Overlap each large dab's undo record, average normal and page staging
     /// on the helper threads (StrokeProcessor::setOverlapPrepare; same results).
     bool overlapPrepare = true;
+    /// With overlapPrepare: also walk the edit region and queue the BVH leaves
+    /// during the preparation (StrokeProcessor::setOverlapRegion; same results).
+    bool overlapRegion = false;
     /// Undo and redo compute the new normals before taking the document lock,
     /// from the history entry's positions staged over the mesh (the dab staging
     /// pages), and only write them under the lock. Same results bit for bit.
@@ -122,6 +125,7 @@ struct InteractionStats {
     double strokeBrushMs = 0.0;
     u64 strokeConeTriangles = 0;
     geo::ChunkedBvh::RefitTimings strokeRefit; ///< refit phases and cone updates, summed over the dabs of the stroke
+    sculpt::StrokeStats strokeStages; ///< every stage timer of the current/last stroke, summed over its dabs
     /// Sculpt-thread time of every input of the current/last stroke (ms).
     std::vector<float> updateSamplesMs;
     /// One per stroke input (begin and updates) of the current/last stroke:
@@ -134,6 +138,10 @@ struct InteractionStats {
         double startedAtMs = 0.0;
         double doneAtMs = 0.0;
         u32 dabs = 0;
+        /// With dabs > 0: commitSequence() after this input's last dab was
+        /// published, and when (steady_clock ms, just before the lock was released).
+        u64 commitSeq = 0;
+        double committedAtMs = 0.0;
         /// AppConfig::coalesceMoveUpdates: a newer queued update of the same
         /// Move stroke replaced this one, which was dropped without being
         /// applied (startedAtMs == doneAtMs: when it was dropped). Its result
@@ -234,6 +242,10 @@ public:
     /// renderer) has not picked up yet. Read and clear only under documentMutex().
     [[nodiscard]] geo::DirtyVertexSet& pendingVertexUpdates() noexcept { return m_dirty; }
 
+    /// Dabs published so far (latency tracing): incremented with each dab's
+    /// commit, under documentMutex(). Read only under documentMutex().
+    [[nodiscard]] const u64& commitSequence() const noexcept { return m_commitSeq; }
+
     /// The spatial chunks and their BVHs. Chunk membership never changes; chunk
     /// bounds do, and may only be read while holding documentMutex().
     [[nodiscard]] const geo::ChunkedBvh& spatialIndex() const noexcept { return m_bvh; }
@@ -290,6 +302,12 @@ public:
     /// The undo history. Test support: read only after waitUntilIdle() with no
     /// further input (the sculpt thread owns it).
     [[nodiscard]] const sculpt::UndoStack& history() const noexcept { return m_undo; }
+    /// Diagnostics (self-test): waits until idle, then recomputes every vertex
+    /// normal from scratch with the whole-mesh reference (one scatter over all
+    /// triangles, PagedMesh::recomputeNormals()) under the document lock and
+    /// marks every vertex dirty, so the renderer shows the reference normals.
+    /// Positions, BVH and history are not touched.
+    void recomputeAllNormalsForReference();
     /// AppConfig::coalesceMoveUpdates, as configured.
     [[nodiscard]] bool coalesceMoveUpdates() const noexcept { return m_coalesceMoveUpdates; }
     /// AppConfig::incrementalCones, as configured (and cones on).
@@ -367,6 +385,8 @@ private:
     sculpt::NormalUpdater m_normalUpdater;
     geo::EditRegion m_region; // undo/redo: affected triangles and vertices
     geo::DirtyVertexSet m_dirty;
+    u64 m_commitSeq = 0;        ///< see commitSequence()
+    double m_lastCommitMs = 0.0; ///< steady_clock ms of the last dab commit
 
     // --- Client thread only ----------------------------------------------------
     sculpt::BrushLibrary m_brushes; // brush objects are immutable; settings are client-side

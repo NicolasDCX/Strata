@@ -488,6 +488,7 @@ void StrokeProcessor::applyDab(const geo::RayHit& hit)
 {
     m_lastCenter = hit.position;
     m_dabTimer.reset();
+    m_regionReady = false;
     core::Stopwatch timer;
     gather(hit.position, m_settings.radius);
     if (m_vertices.empty()) {
@@ -507,16 +508,20 @@ void StrokeProcessor::applyDab(const geo::RayHit& hit)
     const bool overlap = m_overlapPrepare && m_jobs != nullptr && m_jobs->workerCount() > 0 &&
                          m_vertices.size() >= kOverlapPrepareMinVertices;
     if (overlap) {
-        core::parallelFor(m_jobs, 3, 1, [&](std::size_t begin, std::size_t end) {
-            for (std::size_t step = begin; step < end; ++step) {
+        // With the region walk, it goes first: the longest step, claimed first.
+        const std::size_t first = m_overlapRegion ? 0 : 1;
+        core::parallelFor(m_jobs, 4 - first, 1, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t step = begin + first; step < end + first; ++step) {
                 switch (step) {
-                case 0: normalStep(); break;
-                case 1: recordForUndo(); break;
+                case 0: collectRegion(); break;
+                case 1: normalStep(); break;
+                case 2: recordForUndo(); break;
                 default: stagePages(); break;
                 }
             }
         });
         ++m_stats.gather.overlappedDabs;
+        m_stats.normals.overlappedRegions += m_regionReady ? 1u : 0u;
     } else {
         recordForUndo();
         stagePages();
@@ -624,17 +629,34 @@ geo::PagedArrayView<glm::vec3> StrokeProcessor::stagedPositions() noexcept
     return m_staging.view();
 }
 
-void StrokeProcessor::finishEdit()
+void StrokeProcessor::collectRegion()
 {
-    // Prepare, last step: the normals the proposed positions give. One walk
-    // over the adjacency finds what both the normals and the BVH need.
-    core::Stopwatch timer;
+    // One walk over the adjacency finds what both the normals and the BVH
+    // need; then queue the BVH leaves to refit (invisible to readers).
     core::Stopwatch step;
     m_region.collect(m_mesh, m_vertices, m_parallelRegion ? m_jobs : nullptr);
-    const std::span<const u32> affected = m_region.vertices();
     m_stats.normals.regionMs += step.elapsedMs();
     m_stats.normals.parallelRegions += m_region.lastWasParallel() ? 1u : 0u;
     step.reset();
+    m_bvh.markTriangles(m_region.triangles(), m_parallelMarking ? m_jobs : nullptr);
+    m_stats.bvhMs += step.elapsedMs();
+    m_regionReady = true;
+}
+
+void StrokeProcessor::finishEdit()
+{
+    // Prepare, last step: the normals the proposed positions give. The region
+    // walk and leaf marking ran already when they overlapped the preparation.
+    core::Stopwatch timer;
+    const bool walked = std::exchange(m_regionReady, false);
+    if (!walked) {
+        const core::Stopwatch step;
+        m_region.collect(m_mesh, m_vertices, m_parallelRegion ? m_jobs : nullptr);
+        m_stats.normals.regionMs += step.elapsedMs();
+        m_stats.normals.parallelRegions += m_region.lastWasParallel() ? 1u : 0u;
+    }
+    const std::span<const u32> affected = m_region.vertices();
+    core::Stopwatch step;
     m_newNormals.resize(affected.size());
     const geo::PagedArrayView<const glm::vec3> staged = stagedPositions();
     const std::span<glm::vec3> normals(m_newNormals);
@@ -655,10 +677,12 @@ void StrokeProcessor::finishEdit()
     m_stats.normals.moved += m_vertices.size();
     m_stats.normals.triangles += m_region.triangles().size();
     m_stats.normalsMs += timer.elapsedMs();
-    // Queue the BVH leaves to refit: invisible to readers, so no lock yet.
-    timer.reset();
-    m_bvh.markTriangles(m_region.triangles(), m_parallelMarking ? m_jobs : nullptr);
-    m_stats.bvhMs += timer.elapsedMs();
+    if (!walked) {
+        // Queue the BVH leaves to refit: invisible to readers, so no lock yet.
+        timer.reset();
+        m_bvh.markTriangles(m_region.triangles(), m_parallelMarking ? m_jobs : nullptr);
+        m_stats.bvhMs += timer.elapsedMs();
+    }
 
     commit();
 
