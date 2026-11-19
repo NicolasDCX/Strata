@@ -302,6 +302,7 @@ void StrokeProcessor::gatherParallel(const glm::vec3& center, float radius)
         return;
     }
 
+    core::Stopwatch step;
     // 2. Every vertex's first corner in the triangle list (corner k of
     //    triangle t is 3t + k). The serial gather tests a vertex there and
     //    nowhere else, so selecting first corners gives its list and order.
@@ -319,6 +320,8 @@ void StrokeProcessor::gatherParallel(const glm::vec3& center, float radius)
         }
     });
 
+    m_stats.gather.selectFirstMs += step.elapsedMs();
+    step.reset();
     // 3. Test the first occurrences, block by block, then join the blocks in order.
     const auto positions = m_mesh.positions();
     const float radiusSquared = radius * radius;
@@ -353,6 +356,8 @@ void StrokeProcessor::gatherParallel(const glm::vec3& center, float radius)
             }
         }
     });
+    m_stats.gather.selectTestMs += step.elapsedMs();
+    step.reset();
     m_offsets.resize(blockCount + 1);
     m_offsets[0] = 0;
     for (std::size_t b = 0; b < blockCount; ++b) {
@@ -375,6 +380,7 @@ void StrokeProcessor::gatherParallel(const glm::vec3& center, float radius)
             }
         }
     });
+    m_stats.gather.selectJoinMs += step.elapsedMs();
     m_stats.gather.selectMs += timer.elapsedMs();
 }
 
@@ -487,17 +493,46 @@ void StrokeProcessor::applyDab(const geo::RayHit& hit)
     if (m_vertices.empty()) {
         return;
     }
-    recordForUndo();
+    // Undo record, average normal and page staging read the gathered lists
+    // and the mesh, which nothing changes before commit, and each writes its
+    // own state, so they can run at the same time.
+    glm::vec3 normal;
+    const auto normalStep = [&] {
+        const core::Stopwatch normalTimer;
+        normal = averageNormal(hit.normal);
+        m_stats.gather.normalMs += normalTimer.elapsedMs();
+    };
     const double stagedBefore = m_stats.stageMs;
-    stagePages();
-
+    const core::Stopwatch prepare;
+    const bool overlap = m_overlapPrepare && m_jobs != nullptr && m_jobs->workerCount() > 0 &&
+                         m_vertices.size() >= kOverlapPrepareMinVertices;
+    if (overlap) {
+        core::parallelFor(m_jobs, 3, 1, [&](std::size_t begin, std::size_t end) {
+            for (std::size_t step = begin; step < end; ++step) {
+                switch (step) {
+                case 0: normalStep(); break;
+                case 1: recordForUndo(); break;
+                default: stagePages(); break;
+                }
+            }
+        });
+        ++m_stats.gather.overlappedDabs;
+    } else {
+        recordForUndo();
+        stagePages();
+        normalStep();
+    }
+    const double prepareMs = prepare.elapsedMs();
+    m_stats.gather.prepareWallMs += prepareMs;
+    // gatherMs leaves out the staging; overlapped, staging costs no extra time.
+    const double stagingInGather = overlap ? 0.0 : m_stats.stageMs - stagedBefore;
     const DabContext ctx{
         .mesh = m_mesh,
         .positions = stagedPositions(),
         .vertices = m_vertices,
         .weights = m_weights,
         .center = hit.position,
-        .normal = averageNormal(hit.normal),
+        .normal = normal,
         .radius = m_settings.radius,
         .strength = m_settings.strength,
         .direction = m_settings.invert ? -1.0f : 1.0f,
@@ -506,29 +541,48 @@ void StrokeProcessor::applyDab(const geo::RayHit& hit)
         .scratch = m_scratch,
         .jobs = m_jobs,
     };
-    m_stats.gatherMs += timer.elapsedMs() - (m_stats.stageMs - stagedBefore);
+    m_stats.gatherMs += timer.elapsedMs() - stagingInGather;
     timer.reset();
     m_brush->apply(ctx);
     m_stats.brushMs += timer.elapsedMs();
     finishEdit();
 }
 
-void StrokeProcessor::applyGrab(const geo::Ray& ray)
+bool StrokeProcessor::grabActive() const noexcept
+{
+    return m_brush != nullptr && m_brush->mode() == StrokeMode::Grab;
+}
+
+bool StrokeProcessor::grabUpdateApplies(const geo::Ray& ray) const noexcept
+{
+    return grabActive() && grabPlaneDistance(ray).has_value();
+}
+
+std::optional<float> StrokeProcessor::grabPlaneDistance(const geo::Ray& ray) const noexcept
 {
     if (m_vertices.empty()) {
-        return;
+        return std::nullopt;
     }
     // Intersect the pointer ray with the drag plane fixed at begin().
     const float denominator = glm::dot(ray.direction, m_grabPlaneNormal);
     if (std::abs(denominator) < 1e-6f) {
-        return;
+        return std::nullopt;
     }
     const float t = glm::dot(m_grabOrigin - ray.origin, m_grabPlaneNormal) / denominator;
     if (t <= 0.0f) {
+        return std::nullopt;
+    }
+    return t;
+}
+
+void StrokeProcessor::applyGrab(const geo::Ray& ray)
+{
+    const std::optional<float> t = grabPlaneDistance(ray);
+    if (!t) {
         return;
     }
     m_dabTimer.reset();
-    const glm::vec3 delta = ray.at(t) - m_grabOrigin;
+    const glm::vec3 delta = ray.at(*t) - m_grabOrigin;
     m_lastCenter = m_grabOrigin + delta * m_settings.strength;
     stagePages();
 

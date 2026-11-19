@@ -5,6 +5,7 @@
 #include "Editor/MainWindow.h"
 #include "Editor/SelfTest.h"
 #include "Geometry/Icosphere.h"
+#include "Sculpt/Brushes/SmoothBrush.h"
 
 #include <QApplication>
 #include <QColor>
@@ -102,6 +103,18 @@ int runEditor(int argc, char** argv)
         QStringLiteral("region"),
         QStringLiteral("Edit region walk of each dab, undo and redo: on the helper threads for 16K moved vertices or more (parallel, default), or on the sculpt thread (serial). Same results bit for bit."),
         QStringLiteral("parallel|serial"));
+    const QCommandLineOption smoothBinOption(
+        QStringLiteral("smooth-binning"),
+        QStringLiteral("Smooth's kernel grid for dabs of 32K vertices or more: binned on the helper threads, each cell summed in list order (parallel, default), or on the sculpt thread (serial). Same results bit for bit."),
+        QStringLiteral("parallel|serial"));
+    const QCommandLineOption moveUpdatesOption(
+        QStringLiteral("move-updates"),
+        QStringLiteral("Move updates queued behind the one being applied: apply only the newest (latest, default) or every one (all). Same final mesh, undo record and BVH; only intermediate frames are skipped."),
+        QStringLiteral("all|latest"));
+    const QCommandLineOption prepareOption(
+        QStringLiteral("dab-prepare"),
+        QStringLiteral("Undo record, average normal and page staging of each dab of 16K vertices or more: at the same time on the helper threads (overlap, default), or one after the other (serial). Same results bit for bit."),
+        QStringLiteral("overlap|serial"));
     const QCommandLineOption markingOption(
         QStringLiteral("marking"),
         QStringLiteral("Queue each dab's BVH leaves on the helper threads, one chunk per task (parallel, default), or on the sculpt thread (serial). Same results bit for bit."),
@@ -124,7 +137,7 @@ int runEditor(int argc, char** argv)
         QStringLiteral("recompute|reuse"));
     const QCommandLineOption scenarioOption(
         QStringLiteral("selftest-scenario"),
-        QStringLiteral("Self-test script: standard (default), pressure, or history (undo/redo overlapping rendering)."), QStringLiteral("name"));
+        QStringLiteral("Self-test script: standard (default), pressure, history (undo/redo overlapping rendering) or move (live Move strokes at 500 inputs per second)."), QStringLiteral("name"));
     const QCommandLineOption adjacencyOption(
         QStringLiteral("adjacency"),
         QStringLiteral("Storage of the mesh adjacency (neighbours, incident triangles): compact (16-bit offsets, about 58% of the wide size, default) or wide (u32 ids)."),
@@ -143,6 +156,9 @@ int runEditor(int argc, char** argv)
     parser.addOption(gatherOption);
     parser.addOption(markingOption);
     parser.addOption(regionOption);
+    parser.addOption(moveUpdatesOption);
+    parser.addOption(prepareOption);
+    parser.addOption(smoothBinOption);
     parser.addOption(historyNormalsOption);
     parser.addOption(boxRefitOption);
     parser.addOption(conesOption);
@@ -247,6 +263,36 @@ int runEditor(int argc, char** argv)
             config.parallelRegion = false;
         } else {
             core::logWarning("Ignoring invalid --region value");
+        }
+    }
+    if (parser.isSet(smoothBinOption)) {
+        const QString value = parser.value(smoothBinOption).toLower();
+        if (value == QStringLiteral("parallel")) {
+            sculpt::SmoothBrush::setParallelBinning(true);
+        } else if (value == QStringLiteral("serial")) {
+            sculpt::SmoothBrush::setParallelBinning(false);
+        } else {
+            core::logWarning("Ignoring invalid --smooth-binning value");
+        }
+    }
+    if (parser.isSet(moveUpdatesOption)) {
+        const QString value = parser.value(moveUpdatesOption).toLower();
+        if (value == QStringLiteral("latest")) {
+            config.coalesceMoveUpdates = true;
+        } else if (value == QStringLiteral("all")) {
+            config.coalesceMoveUpdates = false;
+        } else {
+            core::logWarning("Ignoring invalid --move-updates value");
+        }
+    }
+    if (parser.isSet(prepareOption)) {
+        const QString value = parser.value(prepareOption).toLower();
+        if (value == QStringLiteral("overlap")) {
+            config.overlapPrepare = true;
+        } else if (value == QStringLiteral("serial")) {
+            config.overlapPrepare = false;
+        } else {
+            core::logWarning("Ignoring invalid --dab-prepare value");
         }
     }
     if (parser.isSet(markingOption)) {
@@ -373,6 +419,8 @@ int runEditor(int argc, char** argv)
         scenario = SelfTest::Scenario::Pressure;
     } else if (parser.value(scenarioOption).toLower() == QStringLiteral("history")) {
         scenario = SelfTest::Scenario::History;
+    } else if (parser.value(scenarioOption).toLower() == QStringLiteral("move")) {
+        scenario = SelfTest::Scenario::Move;
     }
 
     QVulkanInstance vulkanInstance;

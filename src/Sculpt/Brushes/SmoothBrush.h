@@ -28,10 +28,33 @@ public:
     static constexpr float kKernelFraction = 0.3f;
     /// Average vertices per occupied kernel cell from which a region counts as dense.
     static constexpr float kDenseVerticesPerCell = 12.0f;
+    /// With helper threads, dabs of at least this many vertices bin them in
+    /// parallel: each cell still sums its vertices in the order of the list.
+    static constexpr std::size_t kParallelBinMinVertices = 32768;
+    /// Vertices per block of the parallel binning (one cell histogram each).
+    static constexpr std::size_t kBinBlock = 16384;
+    /// Bin in parallel when allowed (default). Off: always the serial loop.
+    /// Same results bit for bit; a process-wide switch for tests and benchmarks.
+    static void setParallelBinning(bool enabled) noexcept;
+    [[nodiscard]] static bool parallelBinning() noexcept;
 
     [[nodiscard]] std::string_view name() const noexcept override { return "Smooth"; }
     [[nodiscard]] StrokeMode mode() const noexcept override { return StrokeMode::Dabs; }
     void apply(const DabContext& ctx) const override;
+
+    /// Profiling: wall time of each stage, summed over the dabs since
+    /// resetSteps(): clear the grid, bin the vertices, count occupied cells,
+    /// kernel targets, kernel commit, Laplacian targets, Laplacian commit.
+    /// Written by the applying thread only.
+    struct Steps {
+        double ms[7] = {};
+        u64 calls = 0;
+        u64 denseCalls = 0;
+        u64 laplacianPasses = 0;
+        u64 parallelBins = 0;
+    };
+    [[nodiscard]] static Steps steps() noexcept;
+    static void resetSteps() noexcept;
 };
 
 } // namespace se::sculpt

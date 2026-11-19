@@ -48,6 +48,13 @@ public:
         /// render back to back, so that frames overlap the commands' lock
         /// holds: the renderer's lock wait, command latency and scratch.
         History,
+        /// Live Move strokes at 500 inputs per second (small to large radius,
+        /// with a reversal), while frames render normally: queue growth, drain
+        /// after release, dropped inputs (AppConfig::coalesceMoveUpdates),
+        /// renderer lock wait; then undo all and redo all. Notes a hash of the
+        /// mesh after every stroke: Move depends only on the last input, so it
+        /// must be the same with --move-updates all and latest.
+        Move,
     };
 
     SelfTest(MainWindow& window, app::AppController& controller, const QString& outputDirectory,
@@ -82,6 +89,13 @@ private:
     /// adds their sculpt-thread costs to the arguments.
     int applyStrongStrokes(std::vector<float>& inputs, double& bvhMs, u32& dabs, u64& coneTriangles);
     void buildHistorySteps();
+    void buildMoveSteps();
+    /// One live Move stroke: `samples` inputs every 2 ms from `from` to `to`,
+    /// back to their midpoint for the last 40%. Appends the mesh hash after it.
+    void runLiveMove(float radius, const QPointF& from, const QPointF& to, int samples, const QString& label,
+                     std::shared_ptr<std::vector<u64>> hashes);
+    /// FNV-1a hash of every position and normal (waits until idle).
+    [[nodiscard]] u64 meshHash() const;
     /// Undoes `steps` strokes and redoes them, `cycles` times, each command
     /// queued as soon as the previous one is published, while a timer requests
     /// a frame every millisecond. Notes the renderer's lock waits, the

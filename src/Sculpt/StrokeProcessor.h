@@ -33,6 +33,16 @@ struct StrokeStats {
         double queryMs = 0.0;  ///< ChunkedBvh::querySphere
         double selectMs = 0.0; ///< de-duplication, distance test and falloff
         double recordMs = 0.0; ///< first touch per stroke: undo record
+        double normalMs = 0.0; ///< average normal of the dab's vertices
+        /// Wall time of undo record + average normal + page staging. When
+        /// they overlap it is less than their sum (stageMs is not in gatherMs).
+        double prepareWallMs = 0.0;
+        u32 overlappedDabs = 0; ///< dabs whose preparation steps overlapped
+        /// selectMs of the parallel gather by step: first corners (atomic
+        /// minimum), distance test and falloff per block, join and reset.
+        double selectFirstMs = 0.0;
+        double selectTestMs = 0.0;
+        double selectJoinMs = 0.0;
     } gather;
     double stageMs = 0.0;   ///< copying the vertex pages of the dab to staging pages
     double brushMs = 0.0;   ///< Brush::apply
@@ -129,6 +139,14 @@ public:
     /// it moves at least EditRegion::kParallelMinVertices vertices: same lists in
     /// the same order. Off by default.
     void setParallelRegion(bool enabled) noexcept { m_parallelRegion = enabled; }
+    /// Runs a dab's three serial preparation steps (undo record, average
+    /// normal, page staging) at the same time on the helper threads when it
+    /// moves at least kOverlapPrepareMinVertices vertices. Each step keeps its
+    /// own loop and order and writes its own state: same results. Off by default
+    /// (on in AppConfig).
+    void setOverlapPrepare(bool enabled) noexcept { m_overlapPrepare = enabled; }
+    [[nodiscard]] bool overlapPrepare() const noexcept { return m_overlapPrepare; }
+    static constexpr std::size_t kOverlapPrepareMinVertices = 16384;
     [[nodiscard]] bool parallelRegion() const noexcept { return m_parallelRegion; }
 
     /// Called around the commit of every dab: `enter` before the first write to
@@ -153,11 +171,21 @@ public:
     std::optional<StrokeDelta> end();
 
     [[nodiscard]] bool active() const noexcept { return m_brush != nullptr; }
+    /// A Grab (Move) stroke is active: every update() re-applies the whole drag
+    /// to the positions captured at begin(), so the result of a run of updates
+    /// depends only on the last one that grabUpdateApplies() accepts.
+    [[nodiscard]] bool grabActive() const noexcept;
+    /// Whether update(ray) would change anything in the active Grab stroke
+    /// (the ray meets the drag plane in front of its origin and the stroke
+    /// captured vertices). An update it rejects is a no-op.
+    [[nodiscard]] bool grabUpdateApplies(const geo::Ray& ray) const noexcept;
     [[nodiscard]] const StrokeStats& stats() const noexcept { return m_stats; }
     /// Scratch kept between dabs: the edit region, the staging pages and their
     /// page table, the new normals, the parallel gather's per-chunk and
     /// per-block lists, and the BVH's parallel-marking lists.
     [[nodiscard]] std::size_t editScratchBytes() const noexcept;
+    /// Working memory lent to the brushes (DabScratch), not in editScratchBytes().
+    [[nodiscard]] std::size_t brushScratchBytes() const noexcept { return m_scratch.memoryBytes(); }
     /// The part of editScratchBytes() only the parallel gather uses.
     [[nodiscard]] std::size_t parallelGatherScratchBytes() const noexcept;
 
@@ -180,6 +208,9 @@ private:
     [[nodiscard]] glm::vec3 averageNormal(const glm::vec3& fallback) const noexcept;
     void applyDab(const geo::RayHit& hit);
     void applyGrab(const geo::Ray& ray);
+    /// Distance along `ray` to the drag plane, or nullopt when applyGrab()
+    /// does nothing for it. Shared by applyGrab() and grabUpdateApplies().
+    [[nodiscard]] std::optional<float> grabPlaneDistance(const geo::Ray& ray) const noexcept;
     /// Copies the vertex pages holding m_vertices to staging pages and points
     /// the staging table at them.
     void stagePages();
@@ -228,6 +259,7 @@ private:
     bool m_parallelGather = false;
     bool m_parallelMarking = false;
     bool m_parallelRegion = false;
+    bool m_overlapPrepare = false;
     // Parallel gather scratch, reused.
     std::vector<u32> m_queryChunks;                 // chunks searched, in query order
     std::vector<std::vector<u32>> m_chunkTriangles; // per searched chunk: its triangles

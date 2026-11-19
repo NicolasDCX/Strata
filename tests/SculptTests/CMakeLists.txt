@@ -9,7 +9,10 @@ se_add_test(se_sculpt_tests
     PagedSculptTests.cpp
     ParallelGatherTests.cpp
     ParallelMarkingTests.cpp
+    OverlappedPrepareTests.cpp
     ParallelRegionTests.cpp
+    SmoothBinningTests.cpp
+    MoveCoalescingTests.cpp
     PrepareCommitTests.cpp
     ParallelTests.cpp
     StrokeTests.cpp

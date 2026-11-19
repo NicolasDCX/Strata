@@ -237,6 +237,47 @@ TEST(AppController, InputCallsReturnWithoutWaitingForTheEdit)
     EXPECT_LT(queueMs, processMs * 0.5) << "queuing took " << queueMs << " ms of " << processMs << " ms total";
 }
 
+TEST(AppController, InputSamplesAccountForEveryInputAndDab)
+{
+    // One sample per stroke input (begin + updates), in order, with consistent
+    // timestamps; their dabs add up to the stroke's dab count. Move applies once
+    // per update and none at begin.
+    for (const BrushId brush : {BrushId::Draw, BrushId::Smooth, BrushId::Move}) {
+        SCOPED_TRACE(static_cast<int>(brush));
+        // Every Move update applied (latest-wins coalescing has its own tests).
+        app::AppConfig config{.sphereSubdivisions = 6, .sphereRadius = 1.0f, .jobThreads = 3};
+        config.coalesceMoveUpdates = false;
+        app::AppController controller(config);
+        controller.setActiveBrush(brush);
+        ASSERT_TRUE(controller.beginStroke(rayAt(-0.4f, 0.0f)));
+        constexpr int kUpdates = 60;
+        for (int i = 1; i <= kUpdates; ++i) {
+            controller.updateStroke(rayAt(-0.4f + 0.012f * static_cast<float>(i), 0.0f));
+        }
+        controller.waitUntilIdle();
+        const app::InteractionStats stats = controller.stats(); // read before the stroke ends
+        controller.endStroke();
+        controller.waitUntilIdle();
+
+        ASSERT_EQ(stats.inputSamples.size(), static_cast<std::size_t>(kUpdates + 1));
+        u32 dabs = 0;
+        for (std::size_t i = 0; i < stats.inputSamples.size(); ++i) {
+            const auto& sample = stats.inputSamples[i];
+            EXPECT_LE(sample.queuedAtMs, sample.startedAtMs);
+            EXPECT_LE(sample.startedAtMs, sample.doneAtMs);
+            if (i > 0) {
+                EXPECT_LE(stats.inputSamples[i - 1].doneAtMs, sample.startedAtMs) << "inputs run one after the other";
+            }
+            if (brush == BrushId::Move) {
+                EXPECT_EQ(sample.dabs, i == 0 ? 0u : 1u);
+            }
+            dabs += sample.dabs;
+        }
+        EXPECT_EQ(dabs, stats.strokeDabCount);
+        EXPECT_GT(dabs, 5u);
+    }
+}
+
 TEST(AppController, ListenerIsCalledAndCanBeRemoved)
 {
     app::AppController controller({.sphereSubdivisions = 4});

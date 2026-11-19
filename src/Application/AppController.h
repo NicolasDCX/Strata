@@ -54,10 +54,25 @@ struct AppConfig {
     /// (84M Draw dab 33 -> 25.5 ms, undo region 61 -> 24 ms); it keeps a 4-byte
     /// stamp per vertex on the sculpt thread (160 MiB at 84M).
     bool parallelRegion = true;
+    /// Overlap each large dab's undo record, average normal and page staging
+    /// on the helper threads (StrokeProcessor::setOverlapPrepare; same results).
+    bool overlapPrepare = true;
     /// Undo and redo compute the new normals before taking the document lock,
     /// from the history entry's positions staged over the mesh (the dab staging
     /// pages), and only write them under the lock. Same results bit for bit.
     bool historyNormalsBeforeLock = false;
+    /// Latest-wins Move updates: when the sculpt thread takes a Move (Grab)
+    /// update and more updates of the same stroke are already queued right
+    /// behind it, it applies only the newest one that would change anything
+    /// and drops the others. A Grab update re-applies the whole drag to the
+    /// positions captured at the stroke's start, so the final positions,
+    /// normals, undo record, dirty pages and (once idle) BVH boxes and cones
+    /// are the same bit for bit; only intermediate frames are skipped. Never
+    /// crosses a begin, end, undo or redo; Draw and Smooth are never coalesced.
+    /// On by default: at 84M triangles, radius 0.25, a 120 Hz Move drained in
+    /// 1.3-1.5 s after release and a 240 Hz one in 4.7-5.0 s; with it, 14-26 ms
+    /// (README, "Latest-wins Move updates").
+    bool coalesceMoveUpdates = true;
     /// BVH refit: a chunk whose refit touches at least half of its leaves
     /// recomputes its whole tree in node order (ChunkedBvh::setDenseRefit).
     /// Same boxes bit for bit; faster for undo/redo and large dabs (README,
@@ -109,6 +124,27 @@ struct InteractionStats {
     geo::ChunkedBvh::RefitTimings strokeRefit; ///< refit phases and cone updates, summed over the dabs of the stroke
     /// Sculpt-thread time of every input of the current/last stroke (ms).
     std::vector<float> updateSamplesMs;
+    /// One per stroke input (begin and updates) of the current/last stroke:
+    /// when it was queued and when the sculpt thread took it and finished it
+    /// (ms on the steady clock), and how many dabs it applied. Finishing an
+    /// input that applied dabs means its last dab is committed and visible to
+    /// the next frame.
+    struct InputSample {
+        double queuedAtMs = 0.0;
+        double startedAtMs = 0.0;
+        double doneAtMs = 0.0;
+        u32 dabs = 0;
+        /// AppConfig::coalesceMoveUpdates: a newer queued update of the same
+        /// Move stroke replaced this one, which was dropped without being
+        /// applied (startedAtMs == doneAtMs: when it was dropped). Its result
+        /// becomes visible with the next sample that is not coalesced.
+        bool coalesced = false;
+    };
+    std::vector<InputSample> inputSamples;
+    /// Inputs of the current/last stroke dropped by AppConfig::coalesceMoveUpdates,
+    /// and since startup.
+    u32 strokeCoalescedInputs = 0;
+    u64 coalescedInputs = 0;
     /// Every hold of the document lock by the sculpt thread during the
     /// current/last stroke (ms): one per dab, the dab's commit. Stroke commands
     /// take the lock for nothing else.
@@ -251,6 +287,11 @@ public:
     void waitUntilIdle();
     /// AppConfig::historyNormalsBeforeLock, as configured.
     [[nodiscard]] bool historyNormalsBeforeLock() const noexcept { return m_historyNormalsBeforeLock; }
+    /// The undo history. Test support: read only after waitUntilIdle() with no
+    /// further input (the sculpt thread owns it).
+    [[nodiscard]] const sculpt::UndoStack& history() const noexcept { return m_undo; }
+    /// AppConfig::coalesceMoveUpdates, as configured.
+    [[nodiscard]] bool coalesceMoveUpdates() const noexcept { return m_coalesceMoveUpdates; }
     /// AppConfig::incrementalCones, as configured (and cones on).
     [[nodiscard]] bool incrementalCones() const noexcept { return m_bvh.incrementalCones(); }
 
@@ -286,6 +327,7 @@ private:
         geo::Ray ray;
         sculpt::BrushId brush = sculpt::BrushId::Draw;
         sculpt::BrushSettings settings;
+        double queuedAtMs = 0.0; ///< steady clock, for InteractionStats::inputSamples
     };
 
     /// State published by the sculpt thread for the client thread.
@@ -300,6 +342,10 @@ private:
     void enqueue(const Command& command);
     void sculptThreadMain();
     void execute(const Command& command);
+    /// Sculpt thread, under m_queueMutex, after taking a Move update: takes the
+    /// updates queued right behind it and returns the one to apply (see
+    /// AppConfig::coalesceMoveUpdates); the dropped ones go to m_coalesced*.
+    Command coalesceMoveUpdates(Command command);
     void publish(const Command& command, double elapsedMs);
     void notifyChanged();
 
@@ -348,9 +394,16 @@ private:
     core::Stopwatch m_holdTimer;         // since the document lock was taken
     std::vector<float> m_pendingHoldsMs; // stroke holds not yet published
     std::vector<float> m_pendingDabsMs;  // dab latencies not yet published
+    std::vector<InteractionStats::InputSample> m_pendingInputs; // input timings not yet published
     double m_lastHistoryHoldMs = 0.0;
     InteractionStats::HistoryProfile m_historyProfile; // sculpt thread: the last undo or redo
     bool m_historyNormalsBeforeLock = false;
+    bool m_coalesceMoveUpdates = false;
+    // Dropped updates of the command being executed (queue times), in queue
+    // order: those before the applied one and those after it.
+    std::vector<double> m_coalescedBefore;
+    std::vector<double> m_coalescedAfter;
+    u32 m_coalescedTotal = 0; // dropped updates not yet published
     std::vector<glm::vec3> m_historyNormals; // undo/redo: new normals, parallel to m_region.vertices()
     bool m_optimizePending = false;
     bool m_measureConeLoss = false;

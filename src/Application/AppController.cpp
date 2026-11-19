@@ -3,8 +3,10 @@
 #include "Core/Log.h"
 #include "Core/Timer.h"
 #include "Geometry/Icosphere.h"
+#include "Sculpt/Brushes/SmoothBrush.h"
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <format>
 #include <string>
@@ -49,7 +51,9 @@ AppController::AppController(const AppConfig& config)
     m_stroke.setParallelGather(config.parallelGather);
     m_stroke.setParallelMarking(config.parallelMarking);
     m_stroke.setParallelRegion(config.parallelRegion);
+    m_stroke.setOverlapPrepare(config.overlapPrepare);
     m_historyNormalsBeforeLock = config.historyNormalsBeforeLock;
+    m_coalesceMoveUpdates = config.coalesceMoveUpdates;
     m_bvh.setDenseRefit(config.denseBoxRefit);
     m_bvh.setIncrementalCones(config.incrementalCones && config.normalCones, config.coneFallbackPercent);
     m_bvh.setReuseConeNormals(config.reuseConeNormals);
@@ -101,10 +105,12 @@ AppController::AppController(const AppConfig& config)
     core::logInfo("Acceleration: {} chunks of up to {} triangles, {} nodes, {:.1f} MiB, normal cones {}", m_bvh.chunkCount(),
                   1u << m_bvh.chunkTriangleShift(), m_bvh.nodeCount(), static_cast<double>(m_bvh.memoryBytes()) / kMiB,
                   m_bvh.hasNormalCones() ? "on" : "off");
-    core::logInfo("Sculpt thread started with {} helper thread(s), {} gather, {} BVH leaf marking, {} edit region, undo/redo normals {} the lock, {} box refit, {} normal cones{}",
+    core::logInfo("Sculpt thread started with {} helper thread(s), {} gather, {} BVH leaf marking, {} edit region, {} dab preparation, {} Smooth binning, {} Move updates, undo/redo normals {} the lock, {} box refit, {} normal cones{}",
                   jobThreadCount(), m_stroke.parallelGather() ? "parallel" : "serial",
                   m_stroke.parallelMarking() ? "parallel" : "serial", m_stroke.parallelRegion() ? "parallel" : "serial",
-                  m_historyNormalsBeforeLock ? "before" : "under",
+                  m_stroke.overlapPrepare() ? "overlapped" : "serial",
+                  sculpt::SmoothBrush::parallelBinning() ? "parallel" : "serial",
+                  m_coalesceMoveUpdates ? "latest-wins" : "every one of the", m_historyNormalsBeforeLock ? "before" : "under",
                   m_bvh.denseRefit() ? "dense" : "incremental",
                   m_bvh.incrementalCones() ? std::format("incremental ({}% fallback)", config.coneFallbackPercent) : std::string("exact"),
                   m_bvh.reuseConeNormals() ? ", face normals reused in the cones' second pass" : "");
@@ -331,11 +337,21 @@ bool AppController::hasDirtyVertices() const
 
 // --- Synchronisation -----------------------------------------------------------------
 
+namespace {
+
+double steadyNowMs() noexcept
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+} // namespace
+
 void AppController::enqueue(const Command& command)
 {
     {
         const std::scoped_lock lock(m_queueMutex);
         m_queue.push_back(command);
+        m_queue.back().queuedAtMs = steadyNowMs();
     }
     m_queueChanged.notify_one();
 }
@@ -378,6 +394,9 @@ void AppController::sculptThreadMain()
                 if (!m_queue.empty()) {
                     command = m_queue.front();
                     m_queue.pop_front();
+                    if (m_coalesceMoveUpdates && command.type == Command::Type::UpdateStroke && m_stroke.grabActive()) {
+                        command = coalesceMoveUpdates(command);
+                    }
                     haveCommand = true;
                     break;
                 }
@@ -415,9 +434,50 @@ void AppController::sculptThreadMain()
     }
 }
 
+AppController::Command AppController::coalesceMoveUpdates(Command command)
+{
+    // Every queued command up to the next one that is not an update belongs to
+    // the active stroke: a stroke ends with EndStroke, and undo, redo and the
+    // next stroke are queued after it. Settings are not queued commands (a
+    // stroke keeps the ones it began with). So only the run of updates right
+    // behind this one is taken, and the stroke's end is still applied after it.
+    m_coalescedBefore.clear();
+    m_coalescedAfter.clear();
+    if (m_queue.empty() || m_queue.front().type != Command::Type::UpdateStroke) {
+        return command;
+    }
+    // Apply the newest update that changes anything. Updates the Grab rejects
+    // (ray parallel to, or pointing away from, the drag plane) are no-ops, so
+    // dropping those after it changes nothing either. If none applies, none
+    // is applied: the last one is executed and does nothing, as each would.
+    std::vector<Command> run;
+    run.push_back(command);
+    while (!m_queue.empty() && m_queue.front().type == Command::Type::UpdateStroke) {
+        run.push_back(m_queue.front());
+        m_queue.pop_front();
+    }
+    std::size_t chosen = run.size() - 1;
+    for (std::size_t i = run.size(); i-- > 0;) {
+        if (m_stroke.grabUpdateApplies(run[i].ray)) {
+            chosen = i;
+            break;
+        }
+    }
+    for (std::size_t i = 0; i < run.size(); ++i) {
+        if (i < chosen) {
+            m_coalescedBefore.push_back(run[i].queuedAtMs);
+        } else if (i > chosen) {
+            m_coalescedAfter.push_back(run[i].queuedAtMs);
+        }
+    }
+    return run[chosen];
+}
+
 void AppController::execute(const Command& command)
 {
     const core::Stopwatch timer;
+    const double startedAtMs = steadyNowMs();
+    const u32 dabsBefore = m_stroke.active() ? m_stroke.stats().dabCount : 0;
     // Stroke commands take no lock here: every dab locks the document only for
     // its commit (see the commit hooks). History prepares its refit before taking the lock.
     switch (command.type) {
@@ -524,6 +584,34 @@ void AppController::execute(const Command& command)
     // The BVH was only refitted. Its touched blocks are re-partitioned in the
     // background once the stroke is over (see sculptThreadMain).
     m_optimizePending = (!m_stroke.active() && m_bvh.needsOptimize()) || m_bvh.hasStaleCones();
+    if (command.type == Command::Type::BeginStroke || command.type == Command::Type::UpdateStroke) {
+        // Dropped updates (coalesceMoveUpdates) keep their place in queue
+        // order: those before the applied one were dropped when it started,
+        // those after it (no-ops) when it finished.
+        const auto dropped = [this](double queuedAtMs, double atMs) {
+            InteractionStats::InputSample sample;
+            sample.queuedAtMs = queuedAtMs;
+            sample.startedAtMs = atMs;
+            sample.doneAtMs = atMs;
+            sample.coalesced = true;
+            m_pendingInputs.push_back(sample);
+        };
+        for (const double queuedAtMs : m_coalescedBefore) {
+            dropped(queuedAtMs, startedAtMs);
+        }
+        InteractionStats::InputSample sample;
+        sample.queuedAtMs = command.queuedAtMs;
+        sample.startedAtMs = startedAtMs;
+        sample.dabs = m_stroke.active() ? m_stroke.stats().dabCount - (command.type == Command::Type::BeginStroke ? 0 : dabsBefore) : 0;
+        sample.doneAtMs = steadyNowMs();
+        m_pendingInputs.push_back(sample);
+        for (const double queuedAtMs : m_coalescedAfter) {
+            dropped(queuedAtMs, sample.doneAtMs);
+        }
+        m_coalescedTotal += static_cast<u32>(m_coalescedBefore.size() + m_coalescedAfter.size());
+        m_coalescedBefore.clear();
+        m_coalescedAfter.clear();
+    }
     publish(command, timer.elapsedMs());
     if (command.type != Command::Type::BeginStroke && command.type != Command::Type::UpdateStroke) {
         measureConeLoss(); // after the command's timing; before any background cone rebuild
@@ -593,6 +681,8 @@ void AppController::publish(const Command& command, double elapsedMs)
         stats.updateSamplesMs.push_back(static_cast<float>(elapsedMs));
         stats.lockHoldSamplesMs.clear();
         stats.dabSamplesMs.clear();
+        stats.inputSamples.clear();
+        stats.strokeCoalescedInputs = 0;
         break;
     case Command::Type::UpdateStroke:
         stats.lastUpdateMs = elapsedMs;
@@ -619,6 +709,13 @@ void AppController::publish(const Command& command, double elapsedMs)
     };
     append(stats.lockHoldSamplesMs, m_pendingHoldsMs);
     append(stats.dabSamplesMs, m_pendingDabsMs);
+    if (stats.inputSamples.size() < 100000) {
+        stats.inputSamples.insert(stats.inputSamples.end(), m_pendingInputs.begin(), m_pendingInputs.end());
+    }
+    m_pendingInputs.clear();
+    stats.strokeCoalescedInputs += m_coalescedTotal;
+    stats.coalescedInputs += m_coalescedTotal;
+    m_coalescedTotal = 0;
     stats.editScratchBytes = m_stroke.editScratchBytes() + m_historyNormals.capacity() * sizeof(glm::vec3) +
                              geo::EditRegion::parallelStampBytes();
     if (m_stroke.active()) {

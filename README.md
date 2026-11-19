@@ -114,6 +114,9 @@ cmake --build --preset release
 | `--box-refit <dense\|incremental>` | BVH box refit: a chunk whose refit touches at least half of its leaves sweeps its whole tree in node order (`dense`, default), or only the touched nodes level by level (`incremental`). Same boxes bit for bit; see "Dense box refit" |
 | `--cones <incremental\|exact>` | Normal cones after an edit: a chunk with at most half of its leaves changed widens its cone by the new normals and gets it rebuilt exactly in the background (`incremental`, default), or every touched chunk recomputes its cone (`exact`). Culling stays conservative either way; see "Incremental normal cones" |
 | `--region <parallel\|serial>` | Edit region walk of each dab, undo and redo on the helper threads when at least 16K vertices moved (`parallel`, default; a 4-byte stamp per vertex, 160 MiB at 84M), or on the sculpt thread (`serial`). Same lists in the same order, same results bit for bit; see "Parallel edit region" |
+| `--dab-prepare <overlap\|serial>` | Undo record, average normal and page staging of each dab of 16K vertices or more: at the same time on the helper threads (`overlap`, default), or one after the other (`serial`). Same results bit for bit; see "Gather profile at 84M and overlapped dab preparation" |
+| `--move-updates <latest\|all>` | Move updates queued behind the one being applied: only the newest that changes anything is applied (`latest`, default), or every one (`all`). Same final mesh, undo record, dirty pages and (once idle) BVH and cones; only intermediate frames are skipped. See "Latest-wins Move updates" |
+| `--smooth-binning <parallel\|serial>` | Smooth's kernel grid for dabs of 32K vertices or more: binned on the helper threads, each cell summed in list order (`parallel`, default; 4 bytes per dab vertex), or on the sculpt thread (`serial`). Same results bit for bit; see "Smooth profile at 84M and parallel kernel-grid binning" |
 | `--cone-normals <reuse\|recompute>` | Exact normal cones keep each face normal of their first pass in a per-thread scratch and reuse it in the second (`reuse`, default; 64 KiB per thread), or compute it again (`recompute`). Same cones bit for bit; see "Face normals reused in exact cones" |
 | `--history-normals <before\|under>` | Undo and redo compute the new normals before taking the document lock, from the history entry's positions staged over the mesh (`before`, opt-in), or under it (`under`, default). Same results bit for bit; shorter lock hold, longer total. See "Undo and redo: normals before the lock" |
 | `--threads <n>` | Helper threads for the sculpt thread. 0 = none. Default: about one per physical core |
@@ -187,19 +190,23 @@ Everything below was actually run on the development machine
 | Check | Result |
 |---|---|
 | Release build, `-Wall -Wextra -Wpedantic -Wshadow -Wconversion` | builds with no warnings in project code |
-| Unit tests | 200 / 200 pass in the release preset (126 geometry, 74 sculpt), including 3 parallel edit-region tests (triangle and vertex lists equal to the serial walk element for element for 3 layouts, shuffled, sorted, repeated, scattered and whole-mesh moved lists and sizes around the threshold, at 1, 3 and 11 helpers; Draw, Smooth and Move strokes and undo/redo through the controller bit-identical to the serial walk). Before them: 197 / 197 (126 geometry, 71 sculpt), including 3 exact-size BVH build tests (node count against the build recursion for every count up to 200,000 and up to 100M; size, capacity and nodes of fresh and reused trees around every split boundary; partial last chunks, serial and threaded, with rays against brute force). Before them: 194 / 194 (123 geometry, 71 sculpt), including 2 face-normal reuse tests (cones bit-identical to `computeNormalCone` for smooth, crumpled, folded and degenerate meshes of 1 to 8,192 triangles; chunk cones exact and no visible triangle culled through repeated folds, serial and with 3 helpers) and reuse runs of the controller cone test. Before them: 192 / 192 (121 geometry, 71 sculpt), including 3 incremental-cone tests (after every edit, partial rebuild and optimize step, every cone holds every normal, no rejected chunk has a triangle facing any of 20 eyes, boxes and picks equal exact cones, cones that are not stale are exact; after the rebuild everything is bit-identical to exact cones; through the controller at 0, 3 and 11 helpers, identical once idle) and a third, incremental-cone variant of the dab and undo/redo concurrent-reader tests. Before them: 187 / 187 (121 geometry, 66 sculpt), including 2 dense-refit tests (every node box, cone, pick and optimize step identical to the incremental refit and to a full refit for edits of any size and chunks of 64 to 4,096 triangles; strokes and undo/redo through the controller identical at 0, 3 and 11 helpers) and the dab and undo/redo concurrent-reader tests run with both refits. Before them: 183 / 183 (121 geometry, 62 sculpt), including 2 history-staging tests (undo/redo with the normals computed before the lock: hash, boxes and cones identical to computing them under it after every step at 0, 1, 3 and 11 helpers; a concurrent reader sees only states between commands, a dirty-page mirror equal to the mesh, and consistent normals, boxes and cones). Before them: 181 / 181 (121 geometry, 60 sculpt), including 3 parallel-marking tests (boxes, cones, picking and every background optimize step identical to serial marking at 0, 1, 3 and 11 helpers, for a shuffled list with duplicates and through Draw, Smooth and Move strokes; undo and redo through the controller, marked before the lock, identical at every step and exact). Before them: 178 / 178 (121 geometry, 57 sculpt), including 2 parallel-gather tests (serial and parallel gather bit-identical at 0, 1, 3 and 11 helpers: every dab's positions and normals, undo deltas, exact undo/redo; switching modes between strokes). Before them: 176 / 176 (121 geometry, 55 sculpt), including 3 prepare/commit tests (preparing a dab changes nothing readers see; after every commit normals, BVH boxes and cones match the positions bit for bit; a concurrent reader only sees states between dabs and a dirty-page mirror equal to the mesh; exact undo/redo through the controller). Before them: 173 / 173 (121 geometry, 52 sculpt), including 5 derived-neighbour geometry tests (rings identical to the stored rows for both layouts, page sizes 16 to 65,536, shuffled ids, valence 300, isolated vertices, flipped, degenerate and shared-vertex fans) and 4 derived-neighbour sculpt tests (Draw, Smooth and Move bit-identical to stored neighbours, serial, parallel and with the wide layout; exact undo/redo with 64-vertex pages and 128-triangle chunks). Before them: 164 / 164 (116 geometry, 48 sculpt), including 3 edit-region tests (the shared per-dab triangle and vertex lists equal the two separate walks, for both layouts and any vertex order; refit from the list bit-identical to refit from the moved vertices, serial and parallel), 5 compact-adjacency geometry tests and 4 compact-adjacency sculpt tests (bit-identical to wide, serial and parallel, exact undo/redo). Before the edit region: 161 / 161 (113 geometry, 48 sculpt). Before compact adjacency: 152 / 152 (108 geometry, 44 sculpt), including 5 normal-cone tests. Earlier: 143 / 143 in the release, debug and headless presets. Removing the old fully resident path removed its 5 page-tracker tests; the dirty-page mapping they covered and the new index-range merging have their own tests |
+| Unit tests | 207 / 207 pass in the release preset (126 geometry, 81 sculpt), including 2 latest-wins Move tests (a 28-step script of overloaded, reversing, zero-drag, rejected-ray, immediate-release, mixed-brush, settings-change and undo/redo strokes at 0, 1, 3 and 11 helpers: positions, normals, undo and redo records, dirty pages, boxes, cones, stale flags, top level and picks equal to applying every update; cones conservative while strokes run; Draw and Smooth never dropped). Before them: 205 / 205 (126 geometry, 79 sculpt), including an input-sample test (Draw, Smooth and Move strokes through the controller: one sample per input in order, consistent queued/started/finished times, inputs processed one after the other, Move one application per update and none at begin, dabs adding up to the stroke's dab count). Before it: 204 / 204 (126 geometry, 78 sculpt), including 2 Smooth-binning tests (one dense dab with its list ascending, shuffled and reversed, and Smooth strokes of 4 radii and strengths: positions, every dab's hash and undo deltas bit-identical to serial binning at 0, 1, 3 and 11 helpers; reversing the block order fails both). Before them: 202 / 202 (126 geometry, 76 sculpt), including 2 overlapped-preparation tests (Draw, Smooth and Move strokes overlapped at 0, 1, 3 and 11 helpers against serial preparation: every dab's hash, undo deltas bit for bit, BVH boxes and cones, picks; undo/redo through the controller). Before them: 200 / 200 (126 geometry, 74 sculpt), with the one-pass edit region and two one-ring-heavy moved sets added to the list-order test (every third vertex of a patch, a random 30% of the mesh). Before: 200 / 200, including 3 parallel edit-region tests (triangle and vertex lists equal to the serial walk element for element for 3 layouts, shuffled, sorted, repeated, scattered and whole-mesh moved lists and sizes around the threshold, at 1, 3 and 11 helpers; Draw, Smooth and Move strokes and undo/redo through the controller bit-identical to the serial walk). Before them: 197 / 197 (126 geometry, 71 sculpt), including 3 exact-size BVH build tests (node count against the build recursion for every count up to 200,000 and up to 100M; size, capacity and nodes of fresh and reused trees around every split boundary; partial last chunks, serial and threaded, with rays against brute force). Before them: 194 / 194 (123 geometry, 71 sculpt), including 2 face-normal reuse tests (cones bit-identical to `computeNormalCone` for smooth, crumpled, folded and degenerate meshes of 1 to 8,192 triangles; chunk cones exact and no visible triangle culled through repeated folds, serial and with 3 helpers) and reuse runs of the controller cone test. Before them: 192 / 192 (121 geometry, 71 sculpt), including 3 incremental-cone tests (after every edit, partial rebuild and optimize step, every cone holds every normal, no rejected chunk has a triangle facing any of 20 eyes, boxes and picks equal exact cones, cones that are not stale are exact; after the rebuild everything is bit-identical to exact cones; through the controller at 0, 3 and 11 helpers, identical once idle) and a third, incremental-cone variant of the dab and undo/redo concurrent-reader tests. Before them: 187 / 187 (121 geometry, 66 sculpt), including 2 dense-refit tests (every node box, cone, pick and optimize step identical to the incremental refit and to a full refit for edits of any size and chunks of 64 to 4,096 triangles; strokes and undo/redo through the controller identical at 0, 3 and 11 helpers) and the dab and undo/redo concurrent-reader tests run with both refits. Before them: 183 / 183 (121 geometry, 62 sculpt), including 2 history-staging tests (undo/redo with the normals computed before the lock: hash, boxes and cones identical to computing them under it after every step at 0, 1, 3 and 11 helpers; a concurrent reader sees only states between commands, a dirty-page mirror equal to the mesh, and consistent normals, boxes and cones). Before them: 181 / 181 (121 geometry, 60 sculpt), including 3 parallel-marking tests (boxes, cones, picking and every background optimize step identical to serial marking at 0, 1, 3 and 11 helpers, for a shuffled list with duplicates and through Draw, Smooth and Move strokes; undo and redo through the controller, marked before the lock, identical at every step and exact). Before them: 178 / 178 (121 geometry, 57 sculpt), including 2 parallel-gather tests (serial and parallel gather bit-identical at 0, 1, 3 and 11 helpers: every dab's positions and normals, undo deltas, exact undo/redo; switching modes between strokes). Before them: 176 / 176 (121 geometry, 55 sculpt), including 3 prepare/commit tests (preparing a dab changes nothing readers see; after every commit normals, BVH boxes and cones match the positions bit for bit; a concurrent reader only sees states between dabs and a dirty-page mirror equal to the mesh; exact undo/redo through the controller). Before them: 173 / 173 (121 geometry, 52 sculpt), including 5 derived-neighbour geometry tests (rings identical to the stored rows for both layouts, page sizes 16 to 65,536, shuffled ids, valence 300, isolated vertices, flipped, degenerate and shared-vertex fans) and 4 derived-neighbour sculpt tests (Draw, Smooth and Move bit-identical to stored neighbours, serial, parallel and with the wide layout; exact undo/redo with 64-vertex pages and 128-triangle chunks). Before them: 164 / 164 (116 geometry, 48 sculpt), including 3 edit-region tests (the shared per-dab triangle and vertex lists equal the two separate walks, for both layouts and any vertex order; refit from the list bit-identical to refit from the moved vertices, serial and parallel), 5 compact-adjacency geometry tests and 4 compact-adjacency sculpt tests (bit-identical to wide, serial and parallel, exact undo/redo). Before the edit region: 161 / 161 (113 geometry, 48 sculpt). Before compact adjacency: 152 / 152 (108 geometry, 44 sculpt), including 5 normal-cone tests. Earlier: 143 / 143 in the release, debug and headless presets. Removing the old fully resident path removed its 5 page-tracker tests; the dirty-page mapping they covered and the new index-range merging have their own tests |
 | Single storage path, 1.3M and 5.2M | standard self-test: the 10 scripted captures (sculpting, undo, redo, camera moves) are pixel-identical to the old fully resident path, and every capture has full coverage (all visible chunks drawn, no stale page). Pressure self-test with the default pools: full, zoomed, after-motion and undo captures identical to the old path, full coverage throughout, 0 evictions |
 | Self-test, 82k triangles (default) | pass: rendering, picking, 3 brushes, undo/redo, camera, real mouse/keyboard events, window resize, on-screen presentation |
 | Self-test, 328k triangles | pass |
 | Self-test, 1.3M triangles | pass |
 | Self-test, 5.2M triangles | pass |
 | Self-test, 21M triangles (`--subdivisions 10`), prepare/commit build and the build before it | pass, exact undo/redo; renderer worst lock wait 16.7 ms before, 0.001 ms after ("Prepare and commit") |
+| Standard self-test at 84M, serial and parallel Smooth binning, back to back, 2 rounds | pass, 237 checks each, picking, exact undo/redo of all strokes, every cone holds its normals; Smooth worst input latency 34.9 / 33.4 → 32.5 / 31.3 ms; dab latency (all brushes) within noise; memory unchanged ("Smooth profile at 84M and parallel kernel-grid binning") |
+| Standard self-test at 84M, serial and overlapped dab preparation, back to back, 2 rounds | pass, 237 checks each, picking, exact undo/redo of all strokes, every cone holds its normals; dab latency median 18.3 / 17.6 → 17.0 / 16.5 ms, p95 23.9 / 23.8 → 21.7 / 21.6 ms; memory unchanged ("Gather profile at 84M and overlapped dab preparation") |
+| Standard self-test at 84M, one-pass edit region against f71cb46, back to back | pass, 237 checks each, picking, exact undo/redo of all strokes, every cone holds its normals; dab latency median 18.9 → 17.9 ms, p95 25.2 → 23.5 ms; edit scratch 480 → 438 MiB ("Dab profile at 84M and the one-pass edit region") |
 | Standard self-test at 84M with the parallel and the serial edit region, and at 21M with the parallel one and with the new default | pass, 237 checks each, picking, exact undo/redo of all strokes, every cone holds its normals; 84M dab latency median 27.3 → 16.5 ms, p95 36.3 → 22.6 ms, lock hold median 2.7 → 2.3 ms; peak commit 11.84 → 12.05 GiB ("Parallel edit region") |
 | Standard self-test at 84M with the exact-size BVH build | pass, 237 checks, picking, exact undo/redo of all strokes, every cone holds its normals; startup 50.0 → 36.2 s ("Exact-size chunk BVH build") |
 | Standard self-test at 84M and 21M, history self-test at 84M (`--subdivisions 11`) | pass, 237 checks each, exact undo/redo, every visible chunk drawn; 84M live-stroke dab latency median 28.9 ms, 155 inputs queued at release ("Scaling checkpoint: 84M triangles") |
 | History self-test, 21M triangles, face normals reused and recomputed in exact cones, 0 and 11 helpers, 2 runs each; standard self-test at 21M with reuse | pass (237 checks for the standard one), exact undo/redo, cones hold every normal; same triangles drawn per frame within 0.03%; undo hold 50.3 → 47.2 ms without helpers, 9.65 → 9.17 ms with 11 ("Face normals reused in exact cones") |
 | History self-test, 21M triangles, exact and incremental cones, 0 and 11 helpers, 2 runs each; standard self-test at 21M with both | pass (238 checks for the standard one), exact undo/redo, cones hold every normal; same triangles drawn per frame within 0.02%; undo hold 52.0 → 50.6 ms without helpers, unchanged with 11 ("Incremental normal cones") |
 | History self-test, 21M triangles, dense and incremental box refit, 0 and 11 helpers, 2 runs each; standard self-test at 21M with both and with the new default | pass (237 checks for the standard one), exact undo/redo; undo hold 11.8 → 9.7 ms with 11 helpers, 70 → 52 ms without ("Dense box refit") |
+| Move self-test (`--selftest-scenario move`), 84M triangles, `--move-updates all` 3 runs and `latest` 4 runs | 6 of 7 pass all 29 checks; the 7th (latest) counted 620 inputs for 500 sent in one stroke, likely stray pointer input, and three reruns counted exactly. Same mesh hashes in every run and mode; undo exact; undone and redone meshes pixel-identical. Large-brush drain 0.33–27.5 s → 15–122 ms ("Latest-wins Move updates") |
 | History self-test (`--selftest-scenario history`), 21M triangles, both normal modes, 0 and 11 helpers, 2 runs each | pass: frames overlap every command, 4 cycles of undo all + redo all end exactly where they began, cones hold every normal, the undone mesh renders pixel-identical to the initial one ("Rendering overlapped with undo/redo") |
 | Self-test, 21M triangles with `--history-normals before`, with it off, and with the build before it; 5.2M with it on | pass, 238 checks each, exact undo/redo ("Undo and redo: normals before the lock") |
 | Self-test, 21M and 5.2M triangles, parallel BVH leaf marking (default), and 21M with the build before it | pass, 237 checks each, exact undo/redo; 21M dab latency median 9.4 → 8.1 ms ("Parallel BVH leaf marking") |
@@ -974,7 +981,7 @@ Live strokes (`live`, 400 inputs every 2 ms, p50 of each dab, lock hold p50, rea
 |---|---|---|---|---|---|
 | 21M, 11 helpers | 8.8 / 10.2 / 5.5 → 6.0 / 7.4 / 3.4 ms (round 2: 8.7 / 9.8 / 5.1 → 6.6 / 8.4 / 3.7) | 7 / 6 / 256 → 7 / 5 / 170 (r2 6 / 5 / 247 → 7 / 5 / 186) | 0.93 → 0.83 (r2 0.88 → 0.91) | ≤ 0.6 / 1.0 both | 6.5, 5.7 (1.9) → 4.2, 3.5 (1.5); r2 6.6, 4.9 → 4.7, 4.2 |
 | 84M, 11 helpers | 35.2 / 39.6 / 24.1 → 25.4 / 31.9 / 14.8 (r2 35.0 / 39.1 / 24.1 → 24.1 / 30.0 / 13.9) | 297 / 291 / 367 → 253 / 257 / 347 (r2 → 248 / 252 / 343) | 3.49 → 3.48 (r2 3.48 → 3.46) | ≤ 2.6 / 3.7 both | 28.9, 23.3 (7.2) → 17.2, 14.5 (7.0); r2 28.4, 23.3 → 16.9, 14.6 |
-| 84M, 11 helpers, radius 0.125 | round 2: 9.1 / 11.0 / 5.7 → 6.7 / 8.8 / 3.9 (round 1 parallel: 5.4 / 7.3 / 3.2) | 121 / 156 / 248 → 16 / 69 / 154 (r2 148 / 172 / 261 → 73 / 120 / 193) | 0.83 → 0.79 (r2 0.96 → 0.96) | ≤ 0.7 / 1.2 both | 9.0 / 8.3 → 4.4 / 4.9 (hold 2.1 / 1.9 → 1.7 / 1.8) |
+| 84M, 11 helpers, radius 0.125 | 8.3 / 10.1 / 5.0 → 5.4 / 7.3 / 3.2 (r2 9.1 / 11.0 / 5.7 → 6.7 / 8.8 / 3.9) | 121 / 156 / 248 → 16 / 69 / 154 (r2 148 / 172 / 261 → 73 / 120 / 193) | 0.83 → 0.79 (r2 0.96 → 0.96) | ≤ 0.7 / 1.2 both | 9.0 / 8.3 → 4.4 / 4.9 (hold 2.1 / 1.9 → 1.7 / 1.8) |
 
 The lock hold and reader wait do not change: the walk runs before the lock. At 84M radius 0.25 the dab still takes longer than the 2 ms input interval, so inputs still queue, but fewer.
 
@@ -996,6 +1003,398 @@ Every hash is identical between the two walks: after every Draw, Smooth and Move
 - **21M:** PASS, 237 checks, with `--region parallel` and with the new default; dab latency median 6.0 ms, peak commit 3.28 GiB.
 
 **Default.** The speedup repeats in both rounds at 21M and 84M, for all three brushes and for undo and redo, and the memory fits, so the parallel walk is the default when helper threads exist. `--region serial` turns it off.
+
+### Dab profile at 84M and the one-pass edit region (default)
+
+**Profile** (`se_bench adjacency … pgather pmark dense icones creuse pregion`, editor defaults, radius 0.25, per edit, commit f71cb46, 11 helpers):
+
+| | dab | gather: query + select + undo record + average normal | edit region | normals compute + dirty | BVH: leaf marking + refits and cones + top | publish + stage | brush |
+|---|---|---|---|---|---|---|---|
+| 84M Draw | 25.5 ms | 9.5 = 2.5 + 3.6 + 1.5 + 1.9 | 6.4 | 2.9 + 0.4 | 3.6 = 1.3 + 2.2 + 0.05 | 1.1 + 1.0 | 0.4 |
+| 84M Smooth | 29.9 | 8.3 = 1.9 + 3.4 + 1.4 + 1.6 | 5.3 | 2.5 + 0.3 | 3.3 | 0.9 + 0.8 | 8.4 |
+| 84M Move | 14.7 | none (Move keeps its stroke's vertices) | 5.6 | 2.7 + 0.4 | 3.5 | 1.0 + 1.0 | 0.5 |
+| 84M Draw, radius 0.125 | 5.6 | 2.0 | 1.5 | 0.6 + 0.1 | 1.0 | 0.2 + 0.2 | 0.07 |
+| 21M Draw | 6.5 | 2.4 | 1.7 | 0.7 + 0.1 | 1.1 | 0.2 + 0.3 | 0.1 |
+
+- **The edit region is the largest single stage** of Draw and Move, and the second of Smooth after its brush.
+- **It is a brush-size cost, not a mesh-size cost:** at 84M with radius 0.125 (the same vertex footprint as 21M at 0.25) every stage costs what it costs at 21M.
+- **Inside the walk** (84M Draw, per walk): stamping the moved vertices 0.25 ms, the row pass 3.1, joining the triangles 0.5, then a second pass over the whole triangle list for the one-ring (stamp 0.9, collect 0.5, join 0.1), and the reset 0.08.
+- **The row pass, split** (a temporary switch that skipped parts of it): decoding the incident rows 0.8 ms, plus fetching each triangle's corners 1.0, plus reading their stamps and appending 1.7.
+- **The marker array does not dominate.** Vertex ids follow the spatial order, so a dab's stamps sit in a small range of the 160 MiB array: stamping and resetting take 0.3 ms together. The cost is the triangles: each region triangle is fetched once per moved corner in the row pass, and once more in the one-ring pass.
+
+**The change** (`EditRegion::collectParallel`, same lists in the same order):
+1. **The row pass also finds the one-ring.** When a row owns a triangle, its unmoved corners are already in hand. Each one's stamp is lowered by atomic minimum to its row index, and the corner is recorded as a candidate in order. The serial walk lists a one-ring vertex at its first corner in the triangle list, which is in the earliest row that owns one of its triangles: the first candidate of that row. The join keeps exactly that candidate, the only one whose row matches the stamp, and marks the vertex taken so that later candidates of the same row are dropped. The second pass over the triangle list is gone.
+2. **Two stamp reads per triangle instead of three**, with a branchless append. The corner that is the row's own vertex is known to hold the row's index. Moved stamps are now indices below 2^31 and one-ring stamps carry the high bit, so "the two other corners hold this index or more" is the ownership test, whichever one-ring stamps other rows are lowering at the same time.
+
+**Tests.** `ListsEqualTheSerialWalkInOrder` gains two moved sets in which most triangles have one-ring corners, owned by rows in different blocks: every third vertex of a large patch, and a random 30% of the mesh. Two mutations each fail it: not marking the vertex taken, and recording the two corners in the wrong order. 200 / 200 tests pass.
+
+**Interleaved runs**, f71cb46 → this change, fresh processes, 2 rounds (round 1 / round 2). Without helpers both builds take the serial walk, which this change does not touch; those runs differ only by noise (up to ±5%, and one baseline outlier at 125 ms where the other three runs were 98–106 ms). The 21M rows differ by about as much as the two rounds of one build.
+
+Dabs (`adjacency`, ms per edit, 11 helpers):
+
+| | Draw: dab / region | Smooth: dab / region | Move: dab / region |
+|---|---|---|---|
+| 84M | 25.1 / 25.9 → 23.3 / 24.4; 6.43 / 6.74 → 4.58 / 4.63 | 30.1 / 31.1 → 28.3 / 30.6; 5.28 / 5.41 → 3.55 / 3.74 | 14.5 / 14.9 → 12.6 / 13.6; 5.58 / 5.78 → 3.69 / 3.99 |
+| 84M, radius 0.125 | 6.65 / 6.78 → 6.23 / 6.58; 1.80 / 1.82 → 1.35 / 1.40 | 8.43 / 8.38 → 7.87 / 8.16; 1.61 / 1.53 → 1.12 / 1.16 | 3.95 / 3.81 → 3.41 / 3.33; 1.54 / 1.50 → 1.10 / 1.09 |
+| 21M | 5.73 / 6.67 → 5.67 / 5.94; 1.49 / 1.72 → 1.22 / 1.21 | 6.88 / 7.68 → 7.21 / 7.32; 1.27 / 1.44 → 1.04 / 1.05 | 2.95 / 3.53 → 3.22 / 3.23; 1.22 / 1.43 → 1.06 / 1.06 |
+
+Live strokes (`live`, 400 inputs every 2 ms, 11 helpers; dab latency p50 / p95 / max, inputs queued at most):
+
+| | Draw | Smooth | Move |
+|---|---|---|---|
+| 84M | 24.4 / 32.2 / 82.1, 264 queued → 23.1 / 27.4 / 53.2, 240 (r2: 25.8 / 30.7 / 60.1, 262 → 23.9 / 28.3 / 54.5, 247) | 29.9 / 37.4 / 44.4, 249 → 31.0 / 37.9 / 41.5, 263 (r2: 31.8 / 37.6 / 45.1, 263 → 30.4 / 35.8 / 39.2, 254) | 13.6 / 15.2 / 18.3, 344 → 12.3 / 14.2 / 15.4, 337 (r2: 14.8 / 17.0 / 19.0, 347 → 13.1 / 14.9 / 15.9, 340) |
+| 84M, radius 0.125 | 6.55 / 7.85 / 28.1, 65 → 5.96 / 7.31 / 26.1, 37 (r2: 6.49 / 7.67 / 28.4, 65 → 6.26 / 7.52 / 27.3, 54) | 8.36 / 9.59 / 12.3, 112 → 7.89 / 9.45 / 12.9, 97 (r2: 8.69 / 10.2 / 13.4, 121 → 7.85 / 9.02 / 12.5, 97) | 3.58 / 4.09 / 5.09, 180 → 3.28 / 3.83 / 4.87, 159 (r2: 3.83 / 4.41 / 4.87, 195 → 3.24 / 3.66 / 3.98, 156) |
+| 21M | 5.37 / 6.11 / 13.8, 6 → 5.77 / 6.42 / 14.6, 7 (r2: 6.53 / 7.85 / 17.2, 8 → 6.12 / 7.91 / 15.0, 7) | 6.67 / 7.76 / 9.27, 4 → 7.23 / 8.64 / 10.4, 5 (r2: 8.02 / 10.7 / 11.3, 5 → 7.83 / 10.2 / 11.6, 5) | 2.93 / 3.09 / 3.49, 131 → 3.00 / 3.34 / 3.71, 136 (r2: 3.52 / 4.05 / 4.42, 176 → 3.47 / 3.98 / 4.58, 168) |
+
+- **Lock hold and renderer wait are unchanged:** the walk runs before the lock. Lock hold p50 is 3.3–3.5 ms per dab at 84M and 0.7–0.9 ms at 21M and at 84M radius 0.125. Reader wait p95 is ≤ 2.6 ms and max ≤ 3.9 ms at 84M, ≤ 1.2 ms at the smaller footprint, in both builds.
+- **The Draw maximum** at 84M is a single outlier dab per stroke (82 / 60 → 53 / 54 ms, against a p95 near 30); its cause was not isolated.
+- **Smooth** is set by its brush (8.4 ms); its region saving (1.7 ms) is within the run-to-run spread of the live stroke.
+
+Undo and redo (`history`, 84M, 11 helpers, typical strokes, p50 per step): the region before the lock 26.0 / 25.4 → 15.4 / 16.5 ms (redo 23.9 / 24.1 → 15.8 / 16.1); undo total 61.6 / 60.7 → 50.7 / 53.9 ms, redo total 57.7 / 57.8 → 50.0 / 53.6 ms; lock hold unchanged (27.9 / 29.8 → 28.3 / 30.8).
+
+**Same results.** Every stroke hash (Draw, Smooth and Move, 21M and 84M, both radii, 0 and 11 helpers) and the hash after the undo/redo cycles are identical between the two builds.
+
+**Memory.** The stamps are unchanged (160 MiB at 84M, 40 MiB at 21M). The per-block one-ring lists of triangle blocks are gone, so the retained edit scratch (stamps included) is smaller: `live` 254.7 → 234.2 MiB at 84M and 64.2 → 59.1 MiB at 21M. Peak commit is unchanged in dab runs (6.94 / 1.73 GiB, set by the sphere generator) and lower in the 84M history run (7.34 → 7.23 GiB).
+
+**Remaining in the walk** (84M Draw, per walk): stamping 0.29 ms, the row pass 2.75, joining the triangles and the one-ring 0.33, joining the vertices 0.20, reset 0.13. The row pass is now row decoding and the corner fetch for each triangle once per moved corner. The next costs of a large dab are the gather (9.5 ms at 84M, its vertex selection 3.6) and, for Smooth, the brush.
+
+**84M Vulkan standard self-test**, the two editors back to back: both PASS, 237 checks, none failed. Picking hits at the camera distance minus the radius, undo and redo restore every vertex exactly (including the strong strokes), and every cone holds its normals. Live strokes in the window, f71cb46 → this change: dab latency median 18.9 → 17.9 ms, p95 25.2 → 23.5 ms, max 29.4 → 27.9 ms; lock hold per dab median 2.78 → 2.81 ms; edit scratch 480.1 → 437.5 MiB; peak commit 12.05 → 11.94 GiB, peak working set 9.64 → 9.57 GiB. An earlier single run of the new build gave 17.8 / 23.6 / 32.0 ms.
+
+**Adopted.** The parallel walk is replaced in place (no option): with 11 helpers the region is 1.4 times faster at 84M in both rounds and for all three brushes and undo/redo, results are bit-identical, and memory goes down. At 21M the dab difference is within the noise between rounds. Without helpers nothing changes.
+
+### Latest-wins Move updates (default)
+
+Measured source: `f71cb46` plus the uncommitted work (source tree `ed4f5f01`; the benchmarks and self-tests ran on the same code with the default still off and the mode chosen by flag). Every other editor default, 11 helper threads.
+
+**The change** (`AppConfig::coalesceMoveUpdates`, `--move-updates latest|all`). When the sculpt thread takes a Move update and more updates are already queued right behind it, it takes that whole run and applies only the newest update that changes anything; the others are dropped and recorded as coalesced. Rules:
+
+- Only consecutive `UpdateStroke` commands, and only while a Move (Grab) stroke is active. Any other queued command ends the run: a stroke's end, undo, redo and the next stroke's begin are separate commands queued after it, so a run never crosses them. Settings are not commands: a stroke keeps the radius and strength it began with, so changing them mid-stroke changes nothing in either mode.
+- The begin input is never dropped, and the stroke's end always comes after the last applied update.
+- "Changes anything": an update the Grab rejects (ray parallel to the drag plane, or meeting it behind its origin) is a no-op. The newest *accepted* update is applied (`StrokeProcessor::grabUpdateApplies`, the same test `applyGrab` uses), so rejected updates at the end of a run cannot hide an earlier accepted one. If none is accepted, none changes anything, as before.
+- Draw and Smooth are never coalesced: their dabs follow the polyline of every input and are cast against the surface already deformed by earlier dabs.
+
+**Why the result is exact, and what else was checked.** A Grab update writes `original + drag × weight` for the vertices captured at begin, so the positions depend only on the newest accepted pointer ray. The other state each update touches, and whether it depends on the path:
+
+| State | Depends on the path? | Checked by |
+|---|---|---|
+| Positions, normals (recomputed for the same edit region from the staged positions) | no | hash after every step, 4 helper counts |
+| Undo record (`before` captured at begin, `after` read at the end) | no | `before` and `after` of every entry, bit for bit |
+| Dirty pages (the same affected vertices are marked by every update) | no: same union | pending dirty set page by page |
+| Chunk BVH boxes (refit from current positions) | no | every node box (`sameBounds`) |
+| Local BVH re-partitioning (touched marks are the same triangles each update; runs only after the stroke) | no | node boxes, `needsOptimize` once idle |
+| Top level: `topStale` is set when any refit changed a chunk's root box, so it can differ when the drag returns exactly to its start (intermediate refits changed the box, the last did not). If `topStale` was clear before the stroke, the top was built from boxes equal to the final ones, and rebuilding it gives the same tree | flag yes, tree no | every top node (box, child, chunk) after idle, including a stroke that ends exactly at its start |
+| Incremental normal cones: a widened cone is widened by every intermediate normal set, so **while a stroke runs and before the background rebuild, cones differ** (latest-wins widens less often, so they are as tight or tighter). Widened chunks are marked stale and rebuilt exactly once the sculpt thread is idle | yes, until idle | every cone, the stale flags and picking after idle; `checkNormalCones` 6 times right after each overloaded stroke (no cone may miss a normal: 0 violations) |
+| Statistics: dab count, per-input samples, stroke centre during the stroke | yes, by design | `inputSamples` marks dropped inputs; `strokeCoalescedInputs`, `coalescedInputs` |
+
+**Tests** (`MoveCoalescingTests`, 2 tests). One script runs at 0, 1, 3 and 11 helpers with latest-wins and compares every step with every update applied. The script covers:
+
+- an overloaded 80-update drag;
+- direction reversals (out, back past the start, out again);
+- a drag that ends exactly at its start;
+- runs whose newest updates the Grab rejects;
+- immediate release with 1 update, 0 updates, and all updates queued with the end;
+- Draw and Smooth strokes between Move strokes;
+- radius and strength changes mid-stroke and between strokes;
+- undo ×3, redo, a new overloaded Move stroke discarding the redo, then undo all and redo all.
+
+Overloaded strokes are queued while the test holds the document lock, so the sculpt thread is stopped at its first commit and the rest pile up. At every one of 28 steps, positions, normals, picks, boxes, cones, stale flags, top level, dirty pages, the undo and redo records and the history counts are equal. At least 100 updates are dropped per run, at least 60 in one stroke. A second test checks that queued Draw and Smooth strokes drop nothing, that a Move stroke keeps its begin input and newest update, and that the sample times stay in order. Two deliberate breaks fail the tests: applying the newest update even when the Grab rejects it, and coalescing every brush. The input-sample test now pins `coalesceMoveUpdates = false`.
+
+**Rates benchmark, Move only** (`se_bench rates <level> 11 only=move [mlatest]`, 3 rounds per mode, interleaved all/latest/latest/all/all/latest; ranges are min–max over the rounds). Applied inputs include the begin input. "Visible (applied)" counts only inputs that were applied. "Visible (every input)" charges a dropped input until the frame showing the newer input that replaced it. "Release to visible" runs from the pointer release to the frame showing the stroke's last applied state. Queue wait is for applied inputs.
+
+84M triangles (level 11):
+
+| Radius | Rate | Mode | Applied / dropped | Queued max / at release | Drain | Queue wait p50 / p95 | Visible p50 / p95 / max (applied) | Visible p50 / p95 / max (every input) | Release to visible | Reader wait max |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0.0625 | 60 Hz | all | 121 / 0 | 1 / 0–1 | 2 ms | 0.0 / 0.0 | 17 / 17 / 33 | 17 / 17 / 33 | 17 ms | 0.1–0.4 |
+| 0.0625 | 60 Hz | latest | 121 / 0 | 1 / 0–1 | 2 ms | 0.0 / 0.0 | 17 / 17 / 33–34 | 17 / 17 / 33–34 | 16–17 ms | 0.0–0.4 |
+| 0.0625 | 120 Hz | all | 241 / 0 | 1 / 0–1 | 2 ms | 0.0 / 0.0 | 16 / 17 / 17–18 | 16 / 17 / 17–18 | 17 ms | 0.3 |
+| 0.0625 | 120 Hz | latest | 241 / 0 | 1 / 0 | 2 ms | 0.0 / 0.0 | 16 / 17 / 17–18 | 16 / 17 / 17–18 | 17–18 ms | 0.3–0.8 |
+| 0.0625 | 240 Hz | all | 481 / 0 | 1 / 0 | 2 ms | 0.0 / 0.0 | 12 / 17 / 18 | 12 / 17 / 18 | 18 ms | 0.6–0.7 |
+| 0.0625 | 240 Hz | latest | 481 / 0 | 1 / 0 | 2 ms | 0.0 / 0.0 | 12 / 17 / 18 | 12 / 17 / 18 | 18 ms | 0.5–0.6 |
+| 0.125 | 60 Hz | all | 121 / 0 | 1 / 0 | 4 ms | 0.0 / 0.0 | 17 / 17 / 17–18 | 17 / 17 / 17–18 | 17 ms | 0.4–0.6 |
+| 0.125 | 60 Hz | latest | 121 / 0 | 1 / 0–1 | 4 ms | 0.0 / 0.0 | 17 / 17 / 17 | 17 / 17 / 17 | 16–17 ms | 0.6–0.7 |
+| 0.125 | 120 Hz | all | 241 / 0 | 1 / 0–1 | 4 ms | 0.0 / 0.0 | 16 / 17 / 17–18 | 16 / 17 / 17–18 | 17–18 ms | 0.6–2.8 |
+| 0.125 | 120 Hz | latest | 241 / 0 | 1 / 0–1 | 4 ms | 0.0 / 0.0 | 16 / 17 / 17–18 | 16 / 17 / 17–18 | 17–18 ms | 0.6–2.0 |
+| 0.125 | 240 Hz | all | 481 / 0 | 1 / 0 | 3–4 ms | 0.0 / 0.0–0.1 | 12 / 17 / 17–18 | 12 / 17 / 17–18 | 17–18 ms | 1.3–2.0 |
+| 0.125 | 240 Hz | latest | 481 / 0 | 1 / 0–1 | 3–4 ms | 0.0 / 0.0–0.1 | 12 / 17 / 17–18 | 12 / 17 / 17–18 | 17–18 ms | 2.3–4.9 |
+| 0.25 | 60 Hz | all | 121 / 0 | 1 / 0 | 14–15 ms | 0.0 / 0.0–0.1 | 17 / 17 / 19–36 | 17 / 17 / 19–36 | 16–17 ms | 2.0–3.1 |
+| 0.25 | 60 Hz | latest | 121 / 0 | 1 / 0 | 14–15 ms | 0.0 / 0.0 | 17 / 17 / 34–35 | 17 / 17 / 34–35 | 16–17 ms | 3.3–4.7 |
+| 0.25 | 120 Hz | all | 241 / 0 | 96–101 / 96–101 | 1333–1467 ms | 661.5–722.9 / 1254.2–1382.3 | 686–750 / 1276–1400 / 1336–1484 | 686–750 / 1276–1400 / 1336–1484 | 1333–1484 ms | 3.5–8.1 |
+| 0.25 | 120 Hz | latest | 140–148 / 93–101 | 2 / 1–2 | 16–26 ms | 4.1–4.4 / 7.7–7.9 | 25 / 35–36 / 36–37 | 25 / 36–37 / 42–45 | 17–34 ms | 3.2–6.7 |
+| 0.25 | 240 Hz | all | 481 / 0 | 336–341 / 336–341 | 4661–4985 ms | 2325.1–2453.8 / 4413.5–4719.2 | 2352–2479 / 4433–4734 / 4667–4989 | 2352–2479 / 4433–4734 / 4667–4989 | 4667–4985 ms | 3.6–3.7 |
+| 0.25 | 240 Hz | latest | 141–146 / 335–340 | 4 / 2–4 | 14–23 ms | 1.9–2.1 / 3.9–4.0 | 21 / 32 / 34 | 26 / 38–39 / 42–46 | 17–34 ms | 3.5–4.1 |
+
+At 21M nothing queues at any rate or radius (a grab takes at most 3.9 ms), so latest-wins drops nothing and every number matches the old mode within noise. The same holds at 84M for radii 0.0625 and 0.125 and at 60 Hz for radius 0.25. Only where the old mode fell behind does anything change:
+
+- **120 Hz:** from 96–101 queued inputs at release and 1.33–1.47 s of drain to at most 2 queued and 16–26 ms, a 50–90× shorter drain.
+- **240 Hz:** from 336–341 queued and 4.66–4.99 s to at most 4 queued and 14–23 ms.
+- **Input to visible (applied):** p95 falls from 1.28–4.73 s to 32–36 ms. Counting every input, dropped ones included, it is 36–39 ms.
+- **Release to visible:** 17–34 ms, at most two frames.
+
+About 140–148 updates are applied per 2 s stroke, the rate one 13.9 ms grab per update allows. Renderer wait is unchanged: max 3.2–6.7 ms against 3.5–8.1. The final mesh hash is identical across modes, rounds and input rates.
+
+**Draw and Smooth** (`se_bench rates 11 11` with each mode, one run each): every Draw and Smooth stroke has the same final hash and dab count in both modes, and nothing is dropped. Their code path is unchanged. The latest-wins run, made first, had dab p50 up to 15% shorter in most cases and 3% longer in one; that is run-to-run variation, not an effect of the setting. **Live bench at 500 Hz** (`se_bench live 11 11 1 … [mlatest]`): Move went from 400 grabs with the stroke done 5,030 ms after the first input (337 queued at release) to 63 grabs done after 823 ms (at most 7 queued). Draw and Smooth were unchanged: 82 and 71 dabs, done after 1.79–1.84 s, dab p50 21.1–21.5 and 25.0–26.0 ms.
+
+**Vulkan Move stress test at 84M** (`SculptEngine --subdivisions 11 --selftest <dir> --selftest-scenario move --move-updates all|latest`). It makes three live Move strokes with one input every 2 ms (radius 0.125, 300 inputs; 0.25, 300; 0.5, 500 with 2.6M vertices per grab). Each goes out and reverses back to the midpoint while frames render. Then it undoes all and redoes all. Each stroke checks: one undo step, every input accounted for, no drops in the `all` mode, renderer wait under 50 ms, and every cone holds its normals. At the end it checks that undo restores every vertex exactly, that the undone mesh renders pixel-identical to the initial one, and that redo restores the hash and image.
+
+| Stroke (84M) | all: queued at release, end applied after release, queue wait p50 | latest: applied / dropped, queued at release, end applied after release, queue wait p50 |
+|---|---|---|
+| radius 0.125, 300 inputs | 0–3, 15–18 ms, 0.0–12.0 ms | 168–301 / 0–133, 0, 10–15 ms, 0.0–0.8 ms |
+| radius 0.25, 300 inputs | 21–217, 330–3,265 ms, 293–1,733 ms | 79–298 / 3–222, 0–4, 15–30 ms, 1.9–7.9 ms |
+| radius 0.5, 500 inputs | 392–460, 23.9–27.5 s, 12.8–13.9 s | 40–128 / 373–554, 1–8, 80–122 ms, 8.4–18.4 ms |
+
+Runs: `all` 3 times and `latest` 4 times. The Qt timer delivers inputs at different effective rates from run to run, which is why the ranges are wide. Renderer wait max was 0.1–4.2 ms for the two smaller strokes and 14.2–17.3 ms for the 2.6M-vertex one in both modes, which is the size of that grab's publish.
+
+All 7 runs end with the same three mesh hashes (`43b8472d…`, `3a8c809f…`, `cb2a3eff…`). Six pass all 29 checks. In one latest run the third stroke recorded 620 inputs for 500 sent (66 applied + 554 dropped), so its "every input accounted for" check failed. The viewport turns real pointer events into stroke updates as well, and that run's hashes and all its other checks were correct. The three reruns (latest, all, latest) counted exactly, so stray pointer input during that run is the likely cause, but it was not proven. The standard self-test at 84M with `--move-updates latest` passes all 237 checks.
+
+**Adopted** as the default (`--move-updates all` applies every update again). All 207 tests pass.
+
+### Responsiveness checkpoint at 21M and 84M (measurement only)
+
+Measured source: `f71cb46` plus the uncommitted work up to parallel Smooth binning and the input-sample instrumentation below (source tree `4019a5f0`); every editor default, 11 helper threads. Nothing in the sculpt path changed for this checkpoint: no inputs are dropped or coalesced, stroke spacing and brush semantics are unchanged.
+
+**Method.** `se_bench rates <level> <helpers>` builds an `AppController` with the editor's `AppConfig` defaults and makes one 2 s stroke for each brush (Draw, Smooth, Move), radius (0.0625, 0.125, 0.25) and input rate (60, 120, 240 Hz), undoing each stroke afterwards. Draw and Smooth move along the equator at 1.5 units per second (a brisk, realistic stroke), so the input rate changes how many inputs describe the same path, not the path; Move drags 0.1 units per second. A reader thread takes the document lock every 16.67 ms (a 60 Hz renderer) and records when. The controller now stamps every stroke input with three times (queued, started, finished on the sculpt thread) and the dabs it applied (`InteractionStats::inputSamples`), so:
+
+- **queue wait** = started − queued: time spent behind earlier inputs;
+- **processing** = finished − started: the raycast, interpolation and every dab the input produced (shown for inputs that applied at least one dab; inputs that applied none take 3–10 µs);
+- **input to visible** = the first reader frame at or after the input finished − queued. Its floor is the 16.7 ms frame interval (p50 below 17 means some inputs landed just before a frame);
+- **drain** = the last input finished − pointer release; **queued** = commands waiting when inputs were sent and at release;
+- **reader wait** = the renderer's wait for the document lock.
+
+Two rounds each; where they differ, both values are shown separated by `;`.
+
+**How inputs become dabs.** Every queued `UpdateStroke` is processed in order on the sculpt thread. Its ray is cast against the surface, then:
+
+- **Draw and Smooth** place one dab per `spacing = radius × 0.25` of surface distance since the last dab (at most 256 per input), each on a ray interpolated between the previous and the new input and cast again against the already deformed surface. The dab rate therefore follows pointer speed ÷ spacing (96 dabs/s at radius 0.0625, 48 at 0.125, 24 at 0.25 at 1.5 units/s), whatever the input rate: at 240 Hz most inputs apply no dab, at 60 Hz small brushes apply 1–2 per input.
+- **Move** applies the grab once per input (none at the begin input): every input re-applies the whole displacement since the start of the stroke to the positions captured at begin. Its cost scales with the input rate, and only the newest queued input determines the result.
+
+There is no pressure in the input path today: commands carry only a ray.
+
+**84M triangles (level 11), 11 helpers:**
+
+| Brush, radius | Input rate | Dabs/s (per input) | Queued max / at release | Drain after release | Queue wait p50 / p95 | Processing p50 / p95 (inputs with dabs) | Input to visible p50 / p95 / max | Dab p50 | Reader wait max |
+|---|---|---|---|---|---|---|---|---|---|
+| Draw 0.0625 | 60 Hz | 96 (1.61) | 1 / 1; 1 / 0 | 3 ms; 2 ms | 0.0 / 0.0 | 4.2 / 5.0; 4.2 / 4.9 | 17 / 17 / 33; 17 / 17 / 34 | 2.2 | 0.7; 0.8 |
+| Draw 0.0625 | 120 Hz | 98 (0.82) | 1 / 0 | 2 ms; 3 ms | 0.0 / 0.0 | 2.4 / 2.8; 2.4 / 2.7 | 17 / 17 / 18; 17 / 17 / 17 | 2.4 | 1.9; 3.8 |
+| Draw 0.0625 | 240 Hz | 104 (0.43) | 1 / 0 | 2 ms; 3 ms | 0.0 / 0.0 | 2.4 / 2.8; 2.4 / 2.7 | 13 / 17 / 21; 13 / 17 / 18 | 2.4 | 0.7 |
+| Draw 0.125 | 60 Hz | 49 (0.82) | 1 / 0 | 6 ms; 5 ms | 0.0 / 0.0 | 5.4 / 6.8; 5.5 / 6.6 | 17 / 17 / 17 | 5.4; 5.5 | 0.9; 0.8 |
+| Draw 0.125 | 120 Hz | 52 (0.44) | 1 / 0 | 6 ms | 0.0 / 0.0 | 5.4 / 6.1; 5.4 / 6.2 | 9 / 17 / 17 | 5.4 | 0.8; 0.9 |
+| Draw 0.125 | 240 Hz | 58 (0.24) | 2 / 0 | 0 ms | 0.0 / 1.6; 0.0 / 1.4 | 5.5 / 6.0; 5.4 / 6.0 | 13 / 21 / 26; 13 / 21 / 25 | 5.4 | 1.0; 0.8 |
+| Draw 0.25 | 60 Hz | 26 (0.44) | 1 / 0 | 0 ms | 0.0 / 7.0; 0.0 / 6.9 | 21.5 / 25.1; 21.6 / 24.6 | 34 / 34 / 34; 33 / 34 / 34 | 21.5; 21.6 | 3.3 |
+| Draw 0.25 | 120 Hz | 30 (0.25) | 3 / 0 | 0 ms | 0.0 / 13.7; 0.1 / 13.7 | 21.2 / 23.1; 21.1 / 22.9 | 25 / 34 / 34 | 21.2; 21.1 | 3.2; 7.2 |
+| Draw 0.25 | 240 Hz | 34 (0.14) | 6 / 0; 7 / 1 | 0 ms | 4.1 / 17.2; 3.8 / 17.0 | 20.9 / 22.6; 20.6 / 22.2 | 26 / 34 / 38 | 20.9; 20.6 | 3.2 |
+| Smooth 0.0625 | 60 Hz | 96 (1.60) | 1 / 1; 1 / 0 | 3 ms | 0.0 / 0.0 | 6.5 / 7.7; 5.9 / 6.8 | 17 / 17 / 17 | 3.5; 3.2 | 0.8; 2.5 |
+| Smooth 0.0625 | 120 Hz | 96 (0.80) | 1 / 1; 1 / 0 | 0 ms | 0.0 / 0.0 | 3.3 / 3.8; 3.2 / 3.7 | 16 / 17 / 17; 17 / 17 / 17 | 3.3; 3.2 | 4.5; 0.8 |
+| Smooth 0.0625 | 240 Hz | 96 (0.40) | 1 / 0; 1 / 1 | 0 ms | 0.0 / 0.0 | 3.4 / 3.9; 3.2 / 3.7 | 12 / 17 / 17 | 3.4; 3.2 | 0.8; 0.7 |
+| Smooth 0.125 | 60 Hz | 48 (0.80) | 1 / 0 | 0 ms | 0.0 / 0.0 | 7.8 / 8.5; 7.6 / 8.6 | 17 / 17 / 17 | 7.8; 7.6 | 0.7; 8.6 |
+| Smooth 0.125 | 120 Hz | 48 (0.40) | 1 / 1 | 0 ms | 0.0 / 0.1; 0.0 / 0.0 | 7.8 / 8.6; 7.6 / 8.6 | 16 / 17 / 25; 17 / 17 / 25 | 7.8; 7.6 | 0.8; 0.9 |
+| Smooth 0.125 | 240 Hz | 48 (0.20) | 2 / 0 | 0 ms | 0.0 / 3.9; 0.0 / 3.7 | 7.8 / 8.5; 7.6 / 8.4 | 17 / 21 / 25 | 7.8; 7.6 | 0.9 |
+| Smooth 0.25 | 60 Hz | 24 (0.40) | 2 / 0 | 0 ms | 0.0 / 15.4; 0.0 / 15.2 | 29.6 / 32.9; 29.6 / 33.6 | 33 / 34 / 36; 34 / 34 / 50 | 29.5; 29.6 | 3.0 |
+| Smooth 0.25 | 120 Hz | 24 (0.20) | 4 / 0 | 0 ms | 4.0 / 21.9; 4.6 / 22.0 | 29.2 / 31.9; 29.8 / 32.6 | 34 / 42 / 42; 34 / 42 / 50 | 29.2; 29.7 | 3.4 |
+| Smooth 0.25 | 240 Hz | 24 (0.10) | 9 / 1; 8 / 0 | 32 ms; 30 ms | 6.7 / 25.8; 5.9 / 25.2 | 30.2 / 33.5; 29.7 / 32.5 | 38 / 46 / 54; 37 / 42 / 46 | 30.2; 29.7 | 5.7; 3.3 |
+| Move 0.0625 | 60 Hz | 60 (1.00) | 1 / 1; 1 / 0 | 2 ms | 0.0 / 0.0 | 2.0 / 2.3; 1.9 / 2.1 | 17 / 17 / 17; 17 / 17 / 18 | 2.0; 1.9 | 0.3; 1.2 |
+| Move 0.0625 | 120 Hz | 120 (1.00) | 1 / 0 | 2 ms | 0.0 / 0.0 | 1.8 / 2.1; 1.8 / 2.0 | 16 / 17 / 17 | 1.8 | 0.3; 0.2 |
+| Move 0.0625 | 240 Hz | 240 (1.00) | 1 / 1; 1 / 0 | 2 ms | 0.0 / 0.0 | 1.8 / 2.0; 1.7 / 2.0 | 12 / 17 / 17; 12 / 17 / 18 | 1.8; 1.7 | 0.2; 0.6 |
+| Move 0.125 | 60 Hz | 60 (1.00) | 1 / 1; 1 / 0 | 4 ms | 0.0 / 0.0 | 3.6 / 4.0 | 17 / 17 / 17 | 3.6 | 4.1; 0.6 |
+| Move 0.125 | 120 Hz | 120 (1.00) | 1 / 0 | 4 ms; 3 ms | 0.0 / 0.0 | 3.6 / 4.0; 3.6 / 3.9 | 16 / 17 / 17 | 3.6 | 3.9; 0.4 |
+| Move 0.125 | 240 Hz | 240 (1.00) | 1 / 0 | 3 ms | 0.0 / 0.0 | 3.4 / 3.7; 3.3 / 3.6 | 12 / 17 / 18 | 3.4; 3.3 | 2.2; 1.8 |
+| Move 0.25 | 60 Hz | 60 (1.00) | 1 / 0 | 14 ms | 0.0 / 0.0 | 13.9 / 14.4; 14.0 / 14.3 | 17 / 17 / 17 | 13.9; 14.0 | 1.7; 4.2 |
+| Move 0.25 | 120 Hz | 72 (1.00) | 97 / 97 | 1352 ms | 671.6 / 1271.5; 672.1 / 1269.8 | 13.9 / 14.3 | 694 / 1292 / 1367; 694 / 1287 / 1361 | 13.9 | 3.3; 7.4 |
+| Move 0.25 | 240 Hz | 72 (1.00) | 337 / 337 | 4677 ms; 4678 ms | 2336.1 / 4429.8; 2335.2 / 4429.9 | 13.8 / 14.2; 13.8 / 14.3 | 2362 / 4450 / 4684 | 13.8 | 3.5; 3.6 |
+
+**21M triangles (level 10), 11 helpers:**
+
+| Brush, radius | Input rate | Dabs/s (per input) | Queued max / at release | Drain after release | Queue wait p50 / p95 | Processing p50 / p95 (inputs with dabs) | Input to visible p50 / p95 / max | Dab p50 | Reader wait max |
+|---|---|---|---|---|---|---|---|---|---|
+| Draw 0.0625 | 60 Hz | 96 (1.61) | 1 / 0 | 1 ms | 0.0 / 0.0 | 2.4 / 2.9; 2.2 / 2.9 | 17 / 17 / 17 | 1.3; 1.2 | 0.7; 0.8 |
+| Draw 0.0625 | 120 Hz | 98 (0.82) | 1 / 0 | 2 ms; 1 ms | 0.0 / 0.0 | 1.4 / 1.6; 1.3 / 1.5 | 17 / 17 / 17 | 1.4; 1.3 | 0.7; 0.6 |
+| Draw 0.0625 | 240 Hz | 104 (0.43) | 1 / 0 | 2 ms; 1 ms | 0.0 / 0.0 | 1.4 / 1.6; 1.3 / 1.5 | 13 / 17 / 17 | 1.4; 1.3 | 0.6; 0.7 |
+| Draw 0.125 | 60 Hz | 49 (0.82) | 1 / 1; 1 / 0 | 3 ms; 2 ms | 0.0 / 0.0 | 3.0 / 3.4; 2.5 / 2.9 | 17 / 17 / 18; 17 / 17 / 17 | 2.9; 2.5 | 0.7; 0.6 |
+| Draw 0.125 | 120 Hz | 52 (0.44) | 1 / 0 | 3 ms | 0.0 / 0.0 | 2.9 / 3.2; 2.5 / 3.0 | 9 / 17 / 17 | 2.9; 2.5 | 0.7; 2.0 |
+| Draw 0.125 | 240 Hz | 58 (0.24) | 1 / 1; 1 / 0 | 0 ms | 0.0 / 0.0 | 2.9 / 3.2; 2.5 / 2.8 | 12 / 17 / 17; 13 / 17 / 17 | 2.9; 2.5 | 0.8; 0.7 |
+| Draw 0.25 | 60 Hz | 26 (0.44) | 1 / 0 | 0 ms | 0.0 / 0.0 | 6.1 / 7.2; 5.6 / 6.9 | 17 / 17 / 17 | 6.0; 5.6 | 0.7 |
+| Draw 0.25 | 120 Hz | 30 (0.25) | 1 / 1; 1 / 0 | 0 ms | 0.0 / 0.0 | 6.0 / 6.4; 5.4 / 6.2 | 9 / 17 / 17 | 6.0; 5.4 | 0.8; 0.7 |
+| Draw 0.25 | 240 Hz | 34 (0.14) | 1 / 1 | 0 ms | 0.0 / 1.9; 0.0 / 1.4 | 6.0 / 6.9; 5.4 / 6.0 | 17 / 21 / 21; 13 / 21 / 22 | 6.0; 5.4 | 0.7; 1.4 |
+| Smooth 0.0625 | 60 Hz | 96 (1.60) | 1 / 0 | 2 ms | 0.0 / 0.0 | 3.2 / 3.9; 2.9 / 3.7 | 17 / 17 / 18 | 1.8; 1.6 | 0.7 |
+| Smooth 0.0625 | 120 Hz | 96 (0.80) | 1 / 0 | 0 ms | 0.0 / 0.0 | 1.8 / 2.1; 1.6 / 2.0 | 16 / 17 / 17 | 1.8; 1.6 | 0.8; 0.7 |
+| Smooth 0.0625 | 240 Hz | 96 (0.40) | 1 / 1 | 0 ms | 0.0 / 0.0 | 1.9 / 2.1; 1.7 / 2.0 | 12 / 17 / 17 | 1.9; 1.7 | 0.7; 0.6 |
+| Smooth 0.125 | 60 Hz | 48 (0.80) | 1 / 1 | 0 ms | 0.0 / 0.0 | 3.7 / 4.0; 3.4 / 3.8 | 17 / 17 / 17 | 3.7; 3.3 | 0.8; 0.7 |
+| Smooth 0.125 | 120 Hz | 48 (0.40) | 1 / 1; 1 / 0 | 0 ms | 0.0 / 0.0 | 3.7 / 4.1; 3.3 / 3.8 | 16 / 17 / 17 | 3.7; 3.3 | 0.8 |
+| Smooth 0.125 | 240 Hz | 48 (0.20) | 1 / 1 | 0 ms | 0.0 / 0.0 | 3.8 / 4.2; 3.4 / 3.8 | 12 / 17 / 17 | 3.8; 3.4 | 0.8; 0.6 |
+| Smooth 0.25 | 60 Hz | 24 (0.40) | 1 / 0; 1 / 1 | 0 ms | 0.0 / 0.0 | 8.7 / 9.3; 7.8 / 9.3 | 17 / 17 / 17 | 8.7; 7.8 | 0.7 |
+| Smooth 0.25 | 120 Hz | 24 (0.20) | 1 / 0 | 0 ms | 0.0 / 0.6; 0.0 / 0.1 | 8.5 / 9.8; 7.8 / 8.8 | 17 / 17 / 25; 17 / 17 / 17 | 8.5; 7.8 | 1.2; 0.8 |
+| Smooth 0.25 | 240 Hz | 24 (0.10) | 2 / 0; 2 / 1 | 8 ms | 0.0 / 4.3; 0.0 / 3.5 | 8.4 / 9.5; 7.7 / 8.7 | 13 / 21 / 21; 13 / 21 / 22 | 8.4; 7.7 | 0.7; 0.8 |
+| Move 0.0625 | 60 Hz | 60 (1.00) | 1 / 1; 1 / 0 | 1 ms | 0.0 / 0.0 | 0.9 / 1.1; 0.9 / 1.2 | 17 / 17 / 17 | 0.9 | 0.0; 0.2 |
+| Move 0.0625 | 120 Hz | 120 (1.00) | 1 / 0; 1 / 1 | 1 ms | 0.0 / 0.0 | 0.9 / 1.1; 0.8 / 1.1 | 9 / 17 / 17 | 0.9; 0.8 | 0.2 |
+| Move 0.0625 | 240 Hz | 240 (1.00) | 1 / 0 | 1 ms | 0.0 / 0.0 | 0.9 / 1.1; 0.8 / 1.0 | 9 / 17 / 18; 9 / 17 / 17 | 0.9; 0.8 | 0.2 |
+| Move 0.125 | 60 Hz | 60 (1.00) | 1 / 1 | 2 ms | 0.0 / 0.0 | 2.0 / 2.2; 1.8 / 2.1 | 17 / 17 / 17 | 2.0; 1.8 | 0.5; 0.6 |
+| Move 0.125 | 120 Hz | 120 (1.00) | 1 / 1; 1 / 0 | 2 ms | 0.0 / 0.0 | 2.0 / 2.2; 1.8 / 2.0 | 16 / 17 / 18; 16 / 17 / 17 | 2.0; 1.8 | 0.6; 0.5 |
+| Move 0.125 | 240 Hz | 240 (1.00) | 1 / 1; 1 / 0 | 2 ms | 0.0 / 0.0 | 2.0 / 2.2; 1.8 / 2.0 | 12 / 17 / 17 | 2.0; 1.8 | 0.3 |
+| Move 0.25 | 60 Hz | 60 (1.00) | 1 / 0 | 4 ms | 0.0 / 0.0 | 3.9 / 4.1; 3.6 / 3.9 | 17 / 17 / 17 | 3.9; 3.6 | 0.8; 0.7 |
+| Move 0.25 | 120 Hz | 120 (1.00) | 1 / 0 | 4 ms | 0.0 / 0.0 | 3.9 / 4.1; 3.6 / 3.8 | 16 / 17 / 17 | 3.9; 3.6 | 0.7; 0.6 |
+| Move 0.25 | 240 Hz | 240 (1.00) | 1 / 1; 1 / 0 | 4 ms; 3 ms | 0.0 / 0.1; 0.0 / 0.0 | 3.7 / 3.9; 3.3 / 3.5 | 12 / 17 / 17; 12 / 17 / 18 | 3.7; 3.3 | 0.7; 0.5 |
+
+**Full dab at 84M with every default** (`se_bench adjacency 11 11 pgather pmark dense icones creuse pregion pprep`, radius 0.25, per dab):
+
+| Brush | Dab | Gather | Normals | BVH refit + cones | Publish | Brush |
+|---|---|---|---|---|---|---|
+| Draw | 21.5 ms | 8.55 (chunk query 2.41, vertex selection 3.60, overlapped record + normal + staging 2.54 wall) | 7.90 (edit region 4.55, compute 2.99, dirty 0.36) | 3.62 | 1.01 | 0.40 |
+| Smooth | 25.4 | 7.63 | 6.60 | 3.36 | 0.90 | 6.87 (binning 2.06, kernel pass 3.01, Laplacian 1.30) |
+| Move | 12.9 | — (vertices captured at begin) | 6.85 (edit region 3.78) | 3.44 | ~2.0 | — |
+
+At radius 0.125 an 84M Draw dab is 4.94 ms, at 0.0625 1.93 ms; a 21M Draw dab at 0.25 is 4.71 ms. The cost follows the dab's vertex count. Inside the controller (the tables' "Dab p50") a Smooth dab is a little slower than in the bench (29.6 ms) because the renderer's frames and the background cone rebuild run alongside.
+
+**Findings.**
+
+- **Draw and Smooth keep up at every rate and footprint.** No backlog builds: at most 9 queued commands, drain ≤ 32 ms. Small and medium brushes and every 21M case are visible within the next frame (p95 17–21 ms). The one visible lag is the large 84M brush: Draw p50/p95 25–34 / 34 ms, Smooth 33–38 / 34–46 ms, max 54 ms, of which up to 26 ms (p95) is queue wait behind the previous dab and ~30 ms the dab itself. This is per-dab geometry cost × dab rate (24–34 dabs/s × 21–30 ms ≈ 60–90% of the sculpt thread): the input rate barely matters, and inputs that apply no dab cost microseconds.
+- **Move at 84M, radius 0.25, falls behind above ~70 Hz.** Each input costs 13.9 ms, so the sculpt thread completes at most ~72 per second. At 120 Hz 97 inputs are queued at release, the stroke finishes 1.35 s after release and the median input is visible after 0.69 s; at 240 Hz 337 inputs, 4.7 s and 2.4 s. All of that is queue wait (processing p95 stays 14.3 ms), and all of it recomputes results that the next input overwrites.
+- **Renderer wait** stays ≤ 3.5 ms in most strokes (outliers 4–8.6 ms); the lock is held only to publish.
+- **Where the 218 queued Smooth inputs came from.** `se_bench live` sends an input every 2 ms (500 Hz) while turning 0.01 rad per input, about 5 units per second, 3.3 times the realistic speed above. At radius 0.25 that is about 5.6 inputs per dab: the 229 inputs queued at release correspond to about 41 remaining dabs × 25.9 ms ≈ 1.06 s, the measured drain (1052 ms). The backlog is dab work owed for distance already travelled, not redundant input work. Draw in the same bench: 223 queued, 1020 ms; Move: 338 queued, 4.35 s (one full application per input).
+
+**What limits responsiveness.**
+
+| Candidate limit | Evidence | Verdict |
+|---|---|---|
+| Geometry processing per dab | Draw/Smooth visible latency at 84M r=0.25 = queue wait behind one ~21–30 ms dab + that dab; small dabs are frame-bound | the limit for Draw and Smooth |
+| Number of interpolated dabs | dabs/s = speed ÷ spacing, independent of input rate; fixed by the spacing contract | not adjustable here; it multiplies the geometry cost |
+| Redundant queued input work | inputs without a dab cost 3–10 µs; Move re-applies the whole grab per input and only the newest counts | the limit for Move (backlog of 97–337 inputs, 1.4–4.7 s drain) |
+
+**Recommendation.**
+
+1. **Next: latest-wins Move updates, as a separate experiment** (`AppConfig` option, off until measured). When the sculpt thread pops a Move `UpdateStroke` and the following queued commands are Move updates of the same stroke, apply only the newest of them. Expected effect: Move at 84M r=0.25 visible within one grab (~14 ms) plus a frame at any input rate, queue ≤ 1, drain ≤ 14 ms instead of 1.35–4.7 s; nothing changes when the sculpt thread keeps up. How exactness is kept:
+   - *Stroke shape:* `applyGrab` is path-independent: it applies the total displacement from the begin ray to the latest ray to the positions captured at begin. Skipping intermediate updates skips only intermediate frames; the final positions and normals are bit-identical.
+   - *Ordering and boundaries:* never look past a command that is not a Move update of the same stroke (begin, end, undo, redo, brush or radius change, another stroke); the begin input and the end are always processed.
+   - *Undo/redo:* the history entry stores the captured originals and the final positions, which do not depend on how many updates were applied; check the undo delta, hash, BVH boxes and cones bit for bit against the uncoalesced run, then undo/redo.
+   - *Pressure:* inputs carry none today. If pressure is added to Move it must be stored with each input and the newest input's pressure applied to the originals, which keeps latest-wins exact; a pressure that accumulates along the path would rule it out.
+   - *Draw and Smooth stay uncoalesced:* their dab positions depend on the polyline of every input and on rays recast against the deformed surface, so merging inputs would change the stroke.
+   - *Measure* with `se_bench rates` (Move rows), the `live` bench and the Vulkan self-test; count skipped inputs in `InteractionStats`.
+2. **Then the large-footprint geometry cost for Draw and Smooth at 84M:** the normals stage (edit region 4.55 ms + compute 2.99 ms per Draw dab, 6.6 ms for Smooth) and the gather's vertex selection (3.6 ms) are the largest repeatable costs left; each millisecond saved there removes about 1–1.3 ms of p95 visible latency at 24–34 dabs/s, and the Smooth brush (6.9 ms) follows.
+
+### Smooth profile at 84M and parallel kernel-grid binning (default)
+
+**Profile** (`se_bench adjacency … pgather pmark dense icones creuse pregion pprep`, editor defaults, radius 0.25, strength 0.5, per dab, two runs). Every Smooth dab in these strokes is dense (12 or more vertices per occupied kernel cell), so each runs the kernel pass and one Laplacian pass:
+
+| Smooth brush stage | 84M, 11 helpers | 84M, 0 helpers | 21M, 11 helpers | 84M radius 0.125, 11 helpers |
+|---|---|---|---|---|
+| brush total | 8.34 / 8.52 ms | 37.8 / 38.5 | 2.39 / 1.80 | 2.49 / 2.42 |
+| kernel grid: binning (serial) | 3.81 / 3.91 | 4.13 / 4.14 | 0.88 / 0.71 | 0.91 / 0.86 |
+| kernel pass + commit (parallel) | 3.05 + 0.12 | 23.0 + 0.85 | 0.87 + 0.12 | 0.95 + 0.13 |
+| Laplacian pass + commit (parallel) | 1.19 + 0.11 | 9.1 + 0.6 | 0.39 + 0.11 | 0.39 + 0.11 |
+| grid clear, occupied-cell count | < 0.01 | < 0.01 | < 0.01 | < 0.01 |
+
+The binning (each vertex's position, normal and count added to its kernel cell) is the largest stage at 84M with helpers. It is also the only one that helpers do not shorten: it takes 4.1 ms with or without them. As with the gather, the 21M and equal-footprint rows match each other: the cost follows the dab's vertex count, not the mesh size.
+
+**The change** (`SmoothBrush::setParallelBinning`, `--smooth-binning parallel`, default). With helper threads and at least 32K dab vertices, binning takes two parallel passes:
+1. Per block of 16K vertices, each vertex's cell and position are stored, and the block's cell histogram is counted.
+2. The cells are cut into contiguous ranges of about equal vertex count, one task per range. A task walks the blocks in list order, skips blocks with no vertex in its range, and adds its own cells' vertices in list order.
+
+Every cell therefore sums the same positions, normals and counts in the same order as the serial loop, so the brush result is bit-identical. Neighbour order, the kernel and Laplacian passes, strength, falloff and stroke spacing are untouched. Smaller dabs and runs without helpers keep the serial loop.
+
+**Tests.** `SmoothBinningTests`:
+- **Direct brush test.** One Smooth dab over a dense cap of 59K vertices, its list in ascending, shuffled and reversed order, at 1, 3 and 11 helpers, against serial binning without helpers and with the same helpers. A cap below the threshold stays serial.
+- **Strokes.** Draw for relief, then Smooth strokes of 4 radii and strengths, at 0, 1, 3 and 11 helpers: every dab's hash and the undo deltas bit for bit.
+- **Mutation.** Walking the blocks in reverse order in pass 2 fails both tests. The existing threaded-Smooth test (`ParallelReference.SmoothDenseModeMatchesSingleThreaded`) does not catch it, because its dabs are below the threshold.
+
+204 / 204 tests pass.
+
+**Interleaved runs**, serial → parallel binning, same binary (`sbinser` selects the serial loop), fresh processes, 2 rounds (round 1 / round 2, the order swapped in round 2), all with overlapped dab preparation.
+
+Dabs (`adjacency`, ms per dab, 11 helpers):
+
+| | Smooth: dab / brush / binning | Draw dab | Move dab |
+|---|---|---|---|
+| 84M | 26.03 / 26.52 → 25.45 / 24.07; 8.34 / 8.52 → 6.98 / 6.12; 3.81 / 3.91 → 2.13 / 1.66 | 20.74 / 20.92 → 21.35 / 20.91 | 12.25 / 12.42 → 12.73 / 12.41 |
+| 84M, radius 0.125 | 7.55 / 7.58 → 6.06 / 7.41; 2.49 / 2.42 → 1.78 / 2.19; 0.91 / 0.86 → 0.62 / 0.67 | 5.59 / 5.72 → 4.69 / 5.75 | 3.39 / 3.50 → 2.79 / 3.51 |
+| 21M | 7.50 / 5.70 → 7.14 / 5.54; 2.39 / 1.80 → 2.04 / 1.55; 0.88 / 0.71 → 0.61 / 0.49 | 5.73 / 4.46 → 5.96 / 4.49 | 3.50 / 2.60 → 3.50 / 2.55 |
+| 84M, radius 0.03 (below the threshold) | 1.04 / 1.24 → 1.01 / 1.23; brush 0.28 / 0.40 → 0.27 / 0.41 | 0.81 / 0.89 → 0.82 / 0.88 | 0.44 / 0.53 → 0.46 / 0.54 |
+| 21M, radius 0.03 | 0.33 / 0.39 → 0.33 / 0.46 | 0.23 / 0.27 → 0.23 / 0.36 | 0.13 / 0.18 → 0.13 / 0.21 |
+
+- **Without helpers** both variants run the serial loop: 84M Smooth 121.7 / 125.9 → 119.2 / 118.7 ms, 21M 23.4 / 23.2 → 23.2 / 24.3 ms.
+- **Binning stays at 1.7–2.1 ms** at 84M, half its serial time rather than a twelfth. How it splits between the two passes was not measured.
+
+Live strokes (`live`, 400 inputs every 2 ms, 11 helpers; dab latency p50 / p95 / max ms, inputs queued max / at release, time to drain after the last input):
+
+| | Smooth | Draw | Move |
+|---|---|---|---|
+| 84M | 27.6 / 31.4 / 37.2, 236 / 235, 1174 ms → 24.8 / 28.1 / 33.4, 218 / 218, 984 ms (r2: 28.8 / 33.5 / 37.9, 244 / 240, 1251 → 24.8 / 27.9 / 33.2, 218 / 218, 961) | 21.4 / 23.6 / 51.0, 223, 1006 → 20.9 / 23.7 / 48.9, 219, 979 (r2: 21.9 / 24.4 / 50.4, 228, 1064 → 21.1 / 23.6 / 49.4, 220, 984) | 12.7 / 13.1 / 13.8, 338, 4326 → 12.4 / 12.8 / 13.6, 336, 4198 (r2: 13.0 / 13.4 / 14.1, 339, 4452 → 12.5 / 12.9 / 14.0, 337, 4239) |
+| 84M, radius 0.125 | 7.17 / 7.88 / 12.0, 62 / 62, 162 → 6.21 / 6.83 / 10.7, 15 / 14, 38 (r2: 6.94 / 7.75 / 11.2, 53 / 53, 137 → 6.81 / 7.40 / 12.3, 46 / 44, 114) | 5.19 / 5.77 / 25.5 → 5.33 / 5.91 / 29.3 (r2: 5.08 / 5.58 / 25.7 → 5.17 / 5.67 / 26.2) | 3.11 / 3.42 / 3.79 → 3.27 / 4.09 / 4.76 (r2: 3.12 / 3.43 / 3.93 → 3.14 / 3.43 / 3.81) |
+| 21M | 7.79 / 8.72 / 10.6, 5 / 4, 24 → 7.62 / 8.61 / 9.81, 5 / 4, 8 (r2: 6.01 / 7.07 / 9.35, 4 / 1, 19 → 5.82 / 6.44 / 8.54, 4 / 1, 26) | 5.86 / 6.58 / 14.9 → 5.74 / 6.49 / 14.6 (r2: 4.48 / 5.03 / 12.6 → 4.63 / 5.45 / 12.4) | 3.45 / 3.71 / 4.08 → 3.37 / 3.62 / 4.03 (r2: 2.54 / 2.73 / 3.00 → 2.53 / 2.77 / 3.29) |
+| 84M, radius 0.03 | 1.07 / 1.22 / 2.33 → 1.07 / 1.21 / 2.42 (r2: 1.31 / 1.77 / 2.67 → 1.61 / 1.87 / 2.95, 29 queued) | 0.86 / 0.99 / 3.39 → 0.85 / 0.97 / 3.37 (r2: 0.96 / 1.27 / 3.93 → 1.18 / 1.39 / 3.95) | 0.47 / 0.68 / 0.91 → 0.46 / 0.62 / 0.88 (r2: 0.55 / 0.77 / 1.06 → 0.77 / 1.02 / 1.14) |
+
+- **Lock hold and renderer wait are unchanged:** the brush runs before the lock. 84M Smooth lock hold p50 3.16 / 3.22 → 3.20 / 3.23 ms; reader wait p95 / max 1.96 / 3.49 and 1.69 / 3.43 → 1.94 / 3.10 and 2.29 / 3.71 ms.
+- **Below the threshold** nothing runs differently. In the second 84M radius-0.03 round, all three brushes of the parallel-binning process were slower, Draw and Move included. That points to that process, not the change.
+- **Without helpers** live latency and backlog are unchanged (84M Smooth p50 125.1 / 122.5 → 125.2 / 121.4 ms, 365 queued).
+
+**Same results.** Every stroke hash (Draw, Smooth and Move; 21M and 84M; radii 0.25, 0.125 and 0.03; 0 and 11 helpers) is identical between the variants.
+
+**Memory.**
+- **Brush scratch (`DabScratch`).** The per-vertex cell index (4 bytes per dab vertex), the block histograms and the earlier sizing of the point array add 4.5 MiB at 84M (13.13 → 17.64 MiB) and 1.1 MiB at 21M (3.30 → 4.43). It is not counted in the edit scratch.
+- **Edit scratch and peak commit** are unchanged (234.2 MiB and 6.94 GiB at 84M, 59.1 MiB and 1.73 GiB at 21M).
+
+**84M Vulkan standard self-test**, serial, parallel, parallel, serial, back to back: all PASS, 237 checks each, none failed.
+- **Smooth stroke:** worst input latency 34.9 / 33.4 → 32.5 / 31.3 ms.
+- **All brushes together:** dab latency median 16.7 / 17.0 → 16.9 / 17.2 ms, p95 22.2 / 22.4 → 22.1 / 22.8 ms, max 30.0 / 25.0 → 27.1 / 27.4 ms. The self-test sculpts mostly with Draw, so this changes within noise.
+- **Unchanged:** lock hold median 2.73–2.84 ms in all four; renderer lock wait max ≤ 2.9 ms; edit scratch 437.5 MiB; peak commit 11.94 GiB.
+
+**Adopted** as the default (`--smooth-binning serial` restores the serial loop).
+- **84M, 11 helpers:** the Smooth brush is 1.4–2.4 ms shorter in both rounds. Live p50 drops by 2.8–4.0 ms, 18–26 fewer inputs are queued, and the drain after release is 190–290 ms shorter.
+- **Smaller footprints** (21M, 84M at radius 0.125): the brush is 0.2–0.7 ms shorter.
+- **Unchanged:** results bit for bit; Draw, Move, runs without helpers and dabs below the threshold stay within baseline variation.
+- **Cost:** 4.5 MiB more brush scratch at 84M.
+
+**Next.** The kernel pass (3.05 ms, already parallel) is now the largest Smooth stage, ahead of binning (1.7–2.1 ms) and the Laplacian pass (1.2 ms).
+
+### Gather profile at 84M and overlapped dab preparation (default)
+
+**Profile** (`se_bench adjacency … pgather pmark dense icones creuse pregion`, editor defaults, radius 0.25, 84M Draw, 11 helpers, per edit, two runs). The gather is 8.3–8.4 ms:
+
+| Part | ms | Shrinks with helpers? |
+|---|---|---|
+| chunk query (`querySphereChunks` + `querySphere` per chunk) | 2.0–2.1 | yes (parallel above 8 chunks) |
+| vertex selection | 3.3 = first corners 1.0 + distance test and falloff 1.75 + join 0.6 | yes |
+| undo record | 1.35 | no: serial, also 1.38 ms with 0 helpers |
+| average normal | 1.7 | no: serial, also 1.78 ms with 0 helpers |
+
+Page staging (1.0–1.1 ms, counted in `stage`, not in the gather) runs right after the undo record. Record, normal and staging are the three serial steps between the selection and the brush: 4.2 ms of wall time per dab, the largest cost that more helpers do not reduce. At 84M with radius 0.125 (the same vertex footprint as 21M at 0.25) and at 21M the parts are a quarter of that (gather 2.0–2.2 ms: query 0.5, selection 0.9, record 0.3, normal 0.3).
+
+**The change** (`StrokeProcessor::setOverlapPrepare`, `--dab-prepare overlap`, default). The three steps read the gathered lists and the mesh, which nothing changes before the commit, and each writes only its own state (the history entry, the staging copies, the brush normal). With helper threads and at least 16K gathered vertices they run as three tasks at the same time; each keeps its own serial loop. The vertex order, the falloff weights, the normal's summation order and the undo records are therefore the same as before by construction. Smaller dabs, Move (which has no per-dab gather) and runs without helpers take the serial path unchanged.
+
+**Tests.** `OverlappedPrepareTests`: Draw, Smooth and Move strokes, crossing strokes (vertices already in the undo record) and a stroke below the threshold, overlapped at 0, 1, 3 and 11 helpers against serial preparation: every dab's hash, the undo deltas (vertices, before and after, bit for bit), BVH boxes and cones, and picks; undo/redo of four strokes through `AppController` with every step's hash, picks and boxes. 202 / 202 tests pass.
+
+**Interleaved runs**, serial → overlapped preparation, same binary, fresh processes, 2 rounds (round 1 / round 2, the order of the two variants swapped in round 2).
+
+Dabs (`adjacency`, ms per edit, 11 helpers; record + normal + staging wall):
+
+| | Draw | Smooth | Move | Wall (Draw) |
+|---|---|---|---|---|
+| 84M | 20.57 / 20.43 → 18.59 / 18.41 | 25.34 / 25.16 → 23.43 / 22.91 | 10.83 / 10.88 → 10.87 / 10.75 | 4.18 / 4.16 → 2.19 / 2.19 |
+| 84M, radius 0.125 | 5.07 / 6.09 → 4.63 / 5.58 | 6.43 / 7.81 → 5.86 / 7.59 | 2.67 / 3.49 → 2.65 / 3.51 | 0.86 / 0.95 → 0.40 / 0.53 |
+| 21M | 5.11 / 4.95 → 4.73 / 4.57 | 6.48 / 6.06 → 6.08 / 5.54 | 2.78 / 2.58 → 2.75 / 2.56 | 0.88 / 0.88 → 0.49 / 0.40 |
+| 84M, radius 0.03 (7.9K vertices, below the threshold) | 0.88 / 0.91 → 0.89 / 0.89 | 1.23 / 1.29 → 1.28 / 1.27 | 0.55 / 0.56 → 0.57 / 0.55 | 0.04 → 0.04 |
+
+- **84M Draw gather by stage**, serial → overlapped: query 2.05 / 2.02 → 2.09 / 1.99, selection 3.30 / 3.27 → 3.32 / 3.27, record 1.35 / 1.35 → 1.55 / 1.52, normal 1.69 / 1.70 → 1.96 / 1.99 ms. Each step takes longer when they overlap, so the wall drops by 2.0 ms, not by the full 3 ms of the two shorter steps.
+- **Without helpers** both variants take the serial path: 84M Draw 93.2 / 90.8 → 96.3 / 89.9, 21M 17.6 / 16.5 → 16.9 / 16.9 ms, the noise between rounds.
+- **Below the threshold** (radius 0.03) nothing overlaps and the numbers stay within the spread of the serial runs.
+
+Live strokes (`live`, 400 inputs every 2 ms, 11 helpers; dab latency p50 / p95 / max ms, inputs queued max / at release):
+
+| | Draw | Smooth | Move |
+|---|---|---|---|
+| 84M | 20.5 / 22.5 / 51.0, 214 / 214 → 18.1 / 20.4 / 45.5, 192 / 189 (r2: 20.2 / 22.5 / 49.1, 212 / 209 → 18.2 / 20.1 / 44.8, 188 / 184) | 25.8 / 29.2 / 33.6, 223 / 223 → 23.7 / 27.7 / 32.9, 206 / 206 (r2: 25.1 / 29.1 / 34.3, 220 / 218 → 23.6 / 27.6 / 33.2, 207 / 206) | 10.6 / 11.2 / 11.7, 327 / 327 → 10.7 / 11.3 / 11.7, 328 / 328 (r2: 10.6 / 11.3 / 13.1, 326 / 326 → 10.6 / 11.3 / 11.9, 326 / 326) |
+| 84M, radius 0.125 | 5.01 / 5.70 / 25.4, 12 / 0 → 4.50 / 5.10 / 24.9, 12 / 0 (r2: 6.25 / 7.13 / 27.0, 51 / 51 → 5.64 / 6.08 / 25.7, 15 / 12) | 6.72 / 7.24 / 11.1, 42 / 41 → 6.16 / 6.76 / 11.0, 15 / 14 (r2: 8.20 / 8.79 / 12.8, 103 / 103 → 7.93 / 8.69 / 13.6, 93 / 91) | 2.62 / 2.80 / 3.16, 98 → 2.65 / 2.83 / 3.32, 100 (r2: 3.47 / 3.62 / 3.91, 171 → 3.46 / 3.62 / 3.83, 171) |
+| 21M | 6.43 / 7.22 / 15.3, 7 / 0 → 5.90 / 6.43 / 15.1, 7 / 1 (r2: 5.16 / 5.82 / 13.6, 6 / 1 → 4.51 / 5.18 / 12.5, 6 / 1) | 8.28 / 9.23 / 11.2, 5 / 4 → 7.90 / 8.84 / 10.4, 5 / 4 (r2: 6.70 / 7.46 / 9.84, 4 / 1 → 6.05 / 7.14 / 8.78, 4 / 1) | 3.44 / 3.63 / 3.88, 169 → 3.46 / 3.64 / 4.04, 170 (r2: 2.57 / 2.77 / 3.14, 92 → 2.61 / 2.80 / 3.14, 94) |
+
+- **Lock hold and renderer wait are unchanged:** the preparation runs before the lock. Lock hold p50 at 84M is 2.87 / 2.89 → 2.84 / 2.84 ms per Draw dab; reader wait p95 / max 2.19 / 2.98 and 1.29 / 2.89 → 1.95 / 2.94 and 1.82 / 2.91 ms.
+- **Without helpers** live latency and backlog do not change (84M Draw 98.3 / 104.1 / 120.3 and 93.4 / 101.1 / 115.3 → 96.6 / 104.4 / 119.0 and 93.1 / 100.5 / 114.2 ms, 360–365 queued).
+- **Undo and redo** do not use the dab preparation: `history` at 84M, 11 helpers, undo hold 24.8 / 28.5 → 24.7 / 29.9 ms, undo total 44.9 / 52.1 → 45.2 / 51.5 ms, the same hash after the cycles.
+
+**Same results.** Every stroke hash (Draw, Smooth and Move; 21M and 84M; radii 0.25, 0.125 and 0.03; 0 and 11 helpers) and the hash after the undo/redo cycles are identical between the variants.
+
+**Memory.** No new buffer: the retained edit scratch is the same (233.8 / 234.2 MiB at 84M, 179.8 at 84M radius 0.125, 59.1 at 21M), and so are peak commit (6.94 GiB at 84M, 1.73 at 21M, 7.23 in the 84M history run) and peak working set (6.45 / 1.61 GiB).
+
+**84M Vulkan standard self-test**, serial, overlapped, overlapped, serial, back to back: all PASS, 237 checks each, none failed. Dab latency median 18.3 / 17.6 → 17.0 / 16.5 ms, p95 23.9 / 23.8 → 21.7 / 21.6 ms, max 29.1 / 29.4 → 25.1 / 24.2 ms; lock hold median 2.76 / 2.71 → 2.72 / 2.71 ms; renderer lock wait max 2.78 / 3.30 → 2.81 / 3.17 ms; edit scratch 437.5 MiB, peak commit 11.94 GiB and peak working set 9.57 GiB in all four.
+
+**Adopted** as the default (`--dab-prepare serial` restores the old order): with 11 helpers it shortens every large Draw and Smooth dab in both rounds (84M Draw −2.0 ms, live p50 −2.3 ms and 20–25 fewer queued inputs; the smaller footprint −0.4 to −0.5 ms), results are bit-identical, memory is unchanged, and Move, runs without helpers and dabs below the threshold stay within baseline variation. The remaining gather is the query (2.0 ms) and the selection (3.3 ms), both already parallel; the Smooth brush (7.7 ms) is the largest single stage of Smooth.
 
 ### Scaling checkpoint: 84M triangles
 

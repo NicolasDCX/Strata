@@ -1,6 +1,7 @@
 #include "Editor/SelfTest.h"
 
 #include "Core/Log.h"
+#include "Core/Timer.h"
 #include "Editor/MainWindow.h"
 #include "Editor/ViewportWindow.h"
 
@@ -20,8 +21,12 @@
 #include <glm/geometric.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstring>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <numeric>
 #include <vector>
 
@@ -251,6 +256,8 @@ void SelfTest::start()
         buildPressureSteps();
     } else if (m_scenario == Scenario::History) {
         buildHistorySteps();
+    } else if (m_scenario == Scenario::Move) {
+        buildMoveSteps();
     } else {
         buildStandardSteps();
     }
@@ -1062,6 +1069,175 @@ void SelfTest::buildHistorySteps()
         const QImage undone(QDir(m_outputDirectory).filePath(QStringLiteral("h02_undone.png")));
         check(imageDifference(initial, undone) == 0.0, QStringLiteral("the undone mesh renders exactly as the initial one"));
     });
+}
+
+u64 SelfTest::meshHash() const
+{
+    m_controller.waitUntilIdle();
+    const std::scoped_lock lock(m_controller.documentMutex());
+    u64 hash = 1469598103934665603ull;
+    const auto mix = [&hash](const glm::vec3& v) {
+        u32 words[3];
+        std::memcpy(words, &v, sizeof(words));
+        for (const u32 word : words) {
+            hash = (hash ^ word) * 1099511628211ull;
+        }
+    };
+    for (const glm::vec3& p : m_controller.mesh().positions()) {
+        mix(p);
+    }
+    for (const glm::vec3& n : m_controller.mesh().normals()) {
+        mix(n);
+    }
+    return hash;
+}
+
+void SelfTest::buildMoveSteps()
+{
+    auto before = std::make_shared<std::vector<glm::vec3>>();
+    auto hashes = std::make_shared<std::vector<u64>>();
+    m_steps.push_back([this, before] {
+        m_window.viewport().frameMesh();
+        capture(QStringLiteral("m01_initial.png"));
+        *before = positions();
+        note(QStringLiteral("Move updates: %1").arg(m_controller.coalesceMoveUpdates() ? QStringLiteral("latest-wins")
+                                                                                       : QStringLiteral("every one applied")));
+    });
+    struct Plan {
+        float radius;
+        double fromX, fromY, toX, toY;
+        int samples;
+    };
+    const Plan plans[] = {{0.125f, 0.45, 0.45, 0.60, 0.30, 300},
+                          {0.25f, 0.55, 0.55, 0.35, 0.70, 300},
+                          {0.5f, 0.50, 0.50, 0.75, 0.40, 500}};
+    for (std::size_t i = 0; i < std::size(plans); ++i) {
+        const Plan plan = plans[i];
+        m_steps.push_back([this, plan, i, hashes] {
+            runLiveMove(plan.radius, viewportPoint(plan.fromX, plan.fromY), viewportPoint(plan.toX, plan.toY), plan.samples,
+                        QStringLiteral("Move %1, radius %2").arg(i + 1).arg(static_cast<double>(plan.radius)), hashes);
+        });
+    }
+    m_steps.push_back([this, before, hashes] {
+        capture(QStringLiteral("m02_moved.png"));
+        const std::size_t steps = m_controller.undoCount();
+        check(steps == 3, QStringLiteral("3 Move strokes, one undo step each (%1)").arg(steps));
+        for (std::size_t i = 0; i < steps; ++i) {
+            m_window.undo();
+        }
+        check(positions() == *before, QStringLiteral("undo of every Move stroke restored every vertex exactly"));
+        if (m_controller.hasNormalCones()) {
+            const auto [violations, usable] = m_controller.checkNormalCones();
+            check(violations == 0, QStringLiteral("after undo: every normal cone holds its chunk's triangle normals (%1 violations, %2 usable)")
+                                       .arg(violations).arg(usable));
+        }
+        capture(QStringLiteral("m03_undone.png"));
+        const QImage initial(QDir(m_outputDirectory).filePath(QStringLiteral("m01_initial.png")));
+        const QImage undone(QDir(m_outputDirectory).filePath(QStringLiteral("m03_undone.png")));
+        check(imageDifference(initial, undone) == 0.0, QStringLiteral("the undone mesh renders exactly as the initial one"));
+        for (std::size_t i = 0; i < steps; ++i) {
+            m_window.redo();
+        }
+        const u64 redone = meshHash();
+        check(!hashes->empty() && redone == hashes->back(), QStringLiteral("redo of every Move stroke restored the moved mesh exactly"));
+        capture(QStringLiteral("m04_redone.png"));
+        const QImage moved(QDir(m_outputDirectory).filePath(QStringLiteral("m02_moved.png")));
+        const QImage redoneImage(QDir(m_outputDirectory).filePath(QStringLiteral("m04_redone.png")));
+        check(imageDifference(moved, redoneImage) == 0.0, QStringLiteral("the redone mesh renders exactly as after the strokes"));
+        QString list;
+        for (const u64 hash : *hashes) {
+            list += QStringLiteral(" %1").arg(hash, 16, 16, QLatin1Char('0'));
+        }
+        note(QStringLiteral("mesh hash after each Move stroke:%1 (must not depend on --move-updates)").arg(list));
+        for (std::size_t i = 0; i < steps; ++i) {
+            m_window.undo();
+        }
+    });
+}
+
+void SelfTest::runLiveMove(float radius, const QPointF& from, const QPointF& to, int samples, const QString& label,
+                           std::shared_ptr<std::vector<u64>> hashes)
+{
+    constexpr int kSampleIntervalMs = 2;
+    holdSteps();
+    m_window.selectBrush(sculpt::BrushId::Move);
+    m_controller.setRadius(radius);
+    ViewportWindow& viewport = m_window.viewport();
+    const u64 hashBefore = meshHash();
+    const std::size_t undoBefore = m_controller.undoCount();
+    // Out to `to` for 60% of the inputs, then back towards the midpoint.
+    const auto pointAt = [from, to, samples](int sample) {
+        const double t = static_cast<double>(sample) / samples;
+        const QPointF mid = (from + to) * 0.5;
+        return t <= 0.6 ? from + (to - from) * (t / 0.6) : to + (mid - to) * ((t - 0.6) / 0.4);
+    };
+    viewport.setFrameSampling(true);
+    m_liveSample = 0;
+    viewport.pointerPress(pointAt(0), Qt::LeftButton, {});
+    auto* timer = new QTimer(this);
+    timer->setTimerType(Qt::PreciseTimer);
+    connect(timer, &QTimer::timeout, this, [this, timer, pointAt, samples, label, hashes, hashBefore, undoBefore] {
+        ViewportWindow& view = m_window.viewport();
+        if (++m_liveSample <= samples) {
+            view.pointerMove(pointAt(m_liveSample));
+            return;
+        }
+        timer->stop();
+        timer->deleteLater();
+        const u32 queuedAtRelease = m_controller.stats().queuedInputs;
+        const core::Stopwatch drain;
+        view.pointerRelease();
+        // Until the stroke's end is applied (not the background BVH work after it).
+        while (m_controller.undoCount() == undoBefore || m_controller.stats().queuedInputs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const double drainMs = drain.elapsedMs();
+        m_controller.waitUntilIdle();
+        view.setFrameSampling(false);
+
+        const app::InteractionStats stats = m_controller.stats();
+        const render::RenderStats& render = view.renderStats();
+        std::vector<float> wait;
+        std::vector<float> process;
+        u32 applied = 0;
+        u32 dropped = 0;
+        for (const auto& s : stats.inputSamples) {
+            if (s.coalesced) {
+                ++dropped;
+                continue;
+            }
+            ++applied;
+            wait.push_back(static_cast<float>(s.startedAtMs - s.queuedAtMs));
+            process.push_back(static_cast<float>(s.doneAtMs - s.startedAtMs));
+        }
+        const u64 hash = meshHash();
+        hashes->push_back(hash);
+        check(hash != hashBefore && m_controller.undoCount() == undoBefore + 1,
+              QStringLiteral("%1: modified the mesh, one undo step").arg(label));
+        check(applied + dropped == static_cast<u32>(samples) + 1u,
+              QStringLiteral("%1: every input accounted for (%2 applied + %3 dropped)").arg(label).arg(applied).arg(dropped));
+        check(m_controller.coalesceMoveUpdates() || dropped == 0, QStringLiteral("%1: no input dropped unless latest-wins is on").arg(label));
+        const double worstWait = percentile(render.lockWaitSamplesMs, 1.0);
+        check(worstWait < 50.0, QStringLiteral("%1: renderer never waited long for the mesh (worst %2 ms)").arg(label).arg(worstWait, 0, 'f', 3));
+        if (m_controller.hasNormalCones()) {
+            const auto [violations, usable] = m_controller.checkNormalCones();
+            check(violations == 0, QStringLiteral("%1: every normal cone holds its chunk's triangle normals (%2 violations, %3 usable)")
+                                       .arg(label).arg(violations).arg(usable));
+        }
+        note(QStringLiteral("%1: %2 inputs at %3 ms, %4 applied, %5 dropped, %6 still queued at release, end applied %7 ms after release, %8 frames, %9 vertices per grab")
+                 .arg(label).arg(samples).arg(kSampleIntervalMs).arg(applied).arg(dropped).arg(queuedAtRelease)
+                 .arg(drainMs, 0, 'f', 0).arg(render.frameCpuSamplesMs.size()).arg(stats.lastDabVertexCount));
+        note(QStringLiteral("  queue wait ms: median %1, p95 %2, max %3 | per applied input ms: median %4, p95 %5, max %6")
+                 .arg(percentile(wait, 0.5), 0, 'f', 1).arg(percentile(wait, 0.95), 0, 'f', 1).arg(percentile(wait, 1.0), 0, 'f', 1)
+                 .arg(percentile(process, 0.5), 0, 'f', 2).arg(percentile(process, 0.95), 0, 'f', 2).arg(percentile(process, 1.0), 0, 'f', 2));
+        note(QStringLiteral("  renderer lock wait ms: median %1, p95 %2, max %3 | frame CPU ms: median %4, p95 %5")
+                 .arg(percentile(render.lockWaitSamplesMs, 0.5), 0, 'f', 3).arg(percentile(render.lockWaitSamplesMs, 0.95), 0, 'f', 3)
+                 .arg(worstWait, 0, 'f', 3).arg(percentile(render.frameCpuSamplesMs, 0.5), 0, 'f', 3)
+                 .arg(percentile(render.frameCpuSamplesMs, 0.95), 0, 'f', 3));
+        note(QStringLiteral("  mesh hash %1").arg(hash, 16, 16, QLatin1Char('0')));
+        resumeSteps();
+    });
+    timer->start(kSampleIntervalMs);
 }
 
 void SelfTest::runOverlappedHistory(const QString& label, int steps, int cycles)

@@ -41,6 +41,14 @@ struct DabScratch {
     std::vector<glm::vec3> points;
     std::vector<glm::vec3> vectors;
     std::vector<float> scalars;
+    std::vector<u32> indices;
+    std::vector<u32> counts;
+
+    [[nodiscard]] std::size_t memoryBytes() const noexcept
+    {
+        return (points.capacity() + vectors.capacity()) * sizeof(glm::vec3) + scalars.capacity() * sizeof(float) +
+               (indices.capacity() + counts.capacity()) * sizeof(u32);
+    }
 };
 
 /// Everything a brush needs for one application. Built by StrokeProcessor.

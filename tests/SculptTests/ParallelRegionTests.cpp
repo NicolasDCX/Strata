@@ -127,6 +127,22 @@ std::vector<std::vector<u32>> movedSets(const geo::Mesh& mesh)
     }
     std::shuffle(all.begin(), all.end(), rng);
     sets.push_back(all);
+    // Sparse: most triangles have one-ring corners, and most one-ring vertices
+    // are corners of triangles owned by several rows in different blocks.
+    const std::vector<u32> patch = movedNear(mesh, {0.3f, 0.3f, 0.9f}, 1.2f, 9);
+    std::vector<u32> sparse;
+    for (std::size_t i = 0; i < patch.size(); i += 3) {
+        sparse.push_back(patch[i]);
+    }
+    sets.push_back(sparse);
+    std::vector<u32> random;
+    for (u32 v = 0; v < mesh.vertexCount(); ++v) {
+        if (rng() % 10 < 3) {
+            random.push_back(v);
+        }
+    }
+    std::shuffle(random.begin(), random.end(), rng);
+    sets.push_back(random);
     // Just below and at the threshold.
     std::vector<u32> big = movedNear(mesh, {0.0f, 0.0f, -1.0f}, 1.0f, 8);
     for (const std::size_t n : {geo::EditRegion::kParallelMinVertices - 1, geo::EditRegion::kParallelMinVertices,

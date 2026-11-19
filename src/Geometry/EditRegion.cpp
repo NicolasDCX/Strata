@@ -1,6 +1,7 @@
 #include "Geometry/EditRegion.h"
 
 #include "Core/Assert.h"
+#include "Core/Timer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -35,9 +36,11 @@ inline void ensureRoom(std::vector<u32>& list, std::size_t count, std::size_t ex
 /// kNoStamp between calls. One array per thread, sized for the largest mesh
 /// walked on it.
 constexpr u32 kNoStamp = 0xFFFFFFFFu;
-constexpr u32 kMovedFlag = 0x80000000u;
+constexpr u32 kTaken = 0xFFFFFFFEu;    ///< one-ring vertex already listed
+constexpr u32 kRingFlag = 0x80000000u; ///< stamps below it: moved vertex indices
 thread_local std::vector<u32> t_stamps;
 std::atomic<std::size_t> g_stampBytes{0};
+EditRegion::ParallelSteps g_steps;
 
 std::vector<u32>& stampsFor(u32 vertexCount)
 {
@@ -47,6 +50,11 @@ std::vector<u32>& stampsFor(u32 vertexCount)
         g_stampBytes.fetch_add((t_stamps.capacity() - before) * sizeof(u32), std::memory_order_relaxed);
     }
     return t_stamps;
+}
+
+inline u32 loadRelaxed(u32& slot) noexcept
+{
+    return std::atomic_ref<u32>(slot).load(std::memory_order_relaxed);
 }
 
 /// Lowers `slot` to `value` unless it already holds a smaller one.
@@ -63,6 +71,16 @@ inline void atomicMin(u32& slot, u32 value) noexcept
 std::size_t EditRegion::parallelStampBytes() noexcept
 {
     return g_stampBytes.load(std::memory_order_relaxed);
+}
+
+EditRegion::ParallelSteps EditRegion::parallelSteps() noexcept
+{
+    return g_steps;
+}
+
+void EditRegion::resetParallelSteps() noexcept
+{
+    g_steps = {};
 }
 
 void EditRegion::collect(const Mesh& mesh, std::span<const VertexId> movedVertices, core::JobSystem* jobs)
@@ -83,25 +101,33 @@ void EditRegion::collectParallel(const Mesh& mesh, std::span<const VertexId> mov
     // - a triangle first appears in the row of its earliest moved corner (the
     //   smallest i among its moved corners), at its place in that row; each
     //   row is walked in order, so every triangle is emitted by that row only;
-    // - a one-ring vertex first appears at its first corner 3p + k in the
-    //   triangle list.
-    // One stamp per vertex holds kMovedFlag | i for moved vertices, the first
-    // corner for one-ring vertices, kNoStamp otherwise. Fixed blocks keep
-    // their finds in order and are joined by prefix sums.
+    // - a one-ring vertex first appears at its first corner in the triangle
+    //   list: in the earliest row that emits a triangle with it, in the first
+    //   such triangle of that row, at its lowest corner index there.
+    // One stamp per vertex: i for moved vertices; kRingFlag | i for one-ring
+    // vertices, i being the earliest row that emits one of their triangles;
+    // kNoStamp otherwise. Rows record their one-ring corners as candidates,
+    // in order, and only the earliest row's first candidate of each vertex is
+    // kept. Fixed blocks of rows keep their finds in order and are joined by
+    // prefix sums, so the triangles are walked once.
     std::vector<u32>& stamps = stampsFor(mesh.vertexCount());
     u32* const stamp = stamps.data();
     const std::size_t movedCount = movedVertices.size();
-    SE_ASSERT(movedCount < kMovedFlag);
+    SE_ASSERT(movedCount < kRingFlag);
 
+    core::Stopwatch step;
     // 1. First index of every moved vertex.
     core::parallelFor(&jobs, movedCount, 4096, [&](std::size_t begin, std::size_t end) {
         for (std::size_t i = begin; i < end; ++i) {
-            atomicMin(stamp[movedVertices[i]], kMovedFlag | static_cast<u32>(i));
+            atomicMin(stamp[movedVertices[i]], static_cast<u32>(i));
         }
     });
+    g_steps.ms[0] += step.elapsedMs();
+    step.reset();
 
-    // 2. Per block of moved vertices: the vertices at their first index, and
-    //    the triangles whose earliest moved corner they are, in row order.
+    // 2. Per block of rows: the moved vertices at their first index, the
+    //    triangles whose earliest moved corner they are, in row order, and the
+    //    one-ring corners of those triangles, in order (candidates).
     const std::size_t vertexBlocks = (movedCount + kParallelVertexBlock - 1) / kParallelVertexBlock;
     if (m_blocks.size() < vertexBlocks) {
         m_blocks.resize(vertexBlocks);
@@ -111,110 +137,112 @@ void EditRegion::collectParallel(const Mesh& mesh, std::span<const VertexId> mov
         for (std::size_t b = first; b < last; ++b) {
             Block& block = m_blocks[b];
             block.moved.clear();
-            block.triangles.clear();
+            block.candidates.clear();
+            std::size_t count = 0;
             const std::size_t end = std::min(movedCount, (b + 1) * kParallelVertexBlock);
             for (std::size_t i = b * kParallelVertexBlock; i < end; ++i) {
                 const VertexId vertex = movedVertices[i];
-                const u32 self = kMovedFlag | static_cast<u32>(i);
+                const u32 self = static_cast<u32>(i);
                 if (stamp[vertex] != self) {
                     continue; // a repeat: its row adds nothing the first did not
                 }
                 block.moved.push_back(vertex);
-                mesh.incidentTriangles(vertex).forEach([&](TriangleId triangle) {
-                    // Stamps of moved vertices are kMovedFlag | index, smaller
-                    // than kNoStamp: the earliest moved corner has the minimum.
+                const AdjacencyRow row = mesh.incidentTriangles(vertex);
+                ensureRoom(block.triangles, count, row.size());
+                u32* const out = block.triangles.data();
+                row.forEach([&](TriangleId triangle) {
+                    // The row owns the triangle when no other moved corner
+                    // comes earlier. The corner that is `vertex` holds `self`,
+                    // distinct moved vertices hold distinct indices and every
+                    // other stamp is kRingFlag or more, so it is enough that
+                    // the two other corners hold `self` or more (a corner equal
+                    // to `vertex` in a degenerate triangle holds `self` too).
+                    // Other rows lower one-ring stamps meanwhile: atomic loads.
                     const Mesh::Triangle& c = corners[triangle];
-                    const u32 owner = std::min({stamp[c[0]], stamp[c[1]], stamp[c[2]]});
-                    if (owner == self) {
-                        block.triangles.push_back(triangle);
+                    const VertexId a = c[0] == vertex ? c[1] : c[0]; // a comes before d in the triangle
+                    const VertexId d = c[2] == vertex ? c[1] : c[2];
+                    const u32 sa = loadRelaxed(stamp[a]);
+                    const u32 sd = loadRelaxed(stamp[d]);
+                    const bool owned = (sa >= self) & (sd >= self);
+                    // Branchless append: ownership follows no pattern.
+                    out[count] = triangle;
+                    count += owned ? 1u : 0u;
+                    // One-ring corners are rare (the border of the region).
+                    if (owned & ((sa >= kRingFlag) | (sd >= kRingFlag))) {
+                        if (sa >= kRingFlag) {
+                            atomicMin(stamp[a], kRingFlag | self);
+                            block.candidates.push_back(a);
+                            block.candidates.push_back(self);
+                        }
+                        if (sd >= kRingFlag) {
+                            atomicMin(stamp[d], kRingFlag | self);
+                            block.candidates.push_back(d);
+                            block.candidates.push_back(self);
+                        }
                     }
                 });
             }
+            block.triangleCount = count;
         }
     });
+    g_steps.ms[1] += step.elapsedMs();
+    step.reset();
 
-    // Join: moved vertices first, then the triangles.
+    // 3. Join the triangles. Keep each block's candidates whose row holds the
+    //    minimum, the first one of each vertex: only the block of that row can
+    //    match, and it marks the vertex taken.
     m_offsets.resize(vertexBlocks + 1);
     m_offsets[0] = 0;
-    for (std::size_t b = 0; b < vertexBlocks; ++b) {
-        m_offsets[b + 1] = m_offsets[b] + m_blocks[b].triangles.size();
-    }
-    const std::size_t triangleCount = m_offsets[vertexBlocks];
     std::size_t movedUnique = 0;
     for (std::size_t b = 0; b < vertexBlocks; ++b) {
+        m_offsets[b + 1] = m_offsets[b] + m_blocks[b].triangleCount;
         movedUnique += m_blocks[b].moved.size();
     }
+    const std::size_t triangleCount = m_offsets[vertexBlocks];
     if (m_triangles.size() < triangleCount) {
         m_triangles.resize(triangleCount + triangleCount / 4);
     }
-    // At most two new corners per triangle.
-    if (m_vertices.size() < movedUnique + triangleCount * 2) {
-        m_vertices.resize(movedUnique + triangleCount * 2 + 1024);
-    }
-    std::vector<std::size_t> movedAt(vertexBlocks + 1);
-    movedAt[0] = 0;
+    core::parallelFor(&jobs, vertexBlocks, 1, [&](std::size_t first, std::size_t last) {
+        for (std::size_t b = first; b < last; ++b) {
+            Block& block = m_blocks[b];
+            std::copy_n(block.triangles.begin(), block.triangleCount, m_triangles.begin() + static_cast<std::ptrdiff_t>(m_offsets[b]));
+            block.ring.clear();
+            const std::vector<u32>& candidates = block.candidates;
+            for (std::size_t c = 0; c < candidates.size(); c += 2) {
+                const VertexId vertex = candidates[c];
+                const std::atomic_ref<u32> slot(stamp[vertex]);
+                if (slot.load(std::memory_order_relaxed) == (kRingFlag | candidates[c + 1])) {
+                    slot.store(kTaken, std::memory_order_relaxed);
+                    block.ring.push_back(vertex);
+                }
+            }
+        }
+    });
+    g_steps.ms[2] += step.elapsedMs();
+    step.reset();
+
+    // 4. Vertex list: the moved vertices, then the one-ring, block by block.
+    m_movedAt.resize(vertexBlocks + 1);
+    m_ringAt.resize(vertexBlocks + 1);
+    m_movedAt[0] = 0;
+    m_ringAt[0] = movedUnique;
     for (std::size_t b = 0; b < vertexBlocks; ++b) {
-        movedAt[b + 1] = movedAt[b] + m_blocks[b].moved.size();
+        m_movedAt[b + 1] = m_movedAt[b] + m_blocks[b].moved.size();
+        m_ringAt[b + 1] = m_ringAt[b] + m_blocks[b].ring.size();
+    }
+    const std::size_t vertexCount = m_ringAt[vertexBlocks];
+    if (m_vertices.size() < vertexCount) {
+        m_vertices.resize(vertexCount + vertexCount / 4);
     }
     core::parallelFor(&jobs, vertexBlocks, 1, [&](std::size_t first, std::size_t last) {
         for (std::size_t b = first; b < last; ++b) {
             const Block& block = m_blocks[b];
-            std::copy(block.triangles.begin(), block.triangles.end(), m_triangles.begin() + static_cast<std::ptrdiff_t>(m_offsets[b]));
-            std::copy(block.moved.begin(), block.moved.end(), m_vertices.begin() + static_cast<std::ptrdiff_t>(movedAt[b]));
+            std::copy(block.moved.begin(), block.moved.end(), m_vertices.begin() + static_cast<std::ptrdiff_t>(m_movedAt[b]));
+            std::copy(block.ring.begin(), block.ring.end(), m_vertices.begin() + static_cast<std::ptrdiff_t>(m_ringAt[b]));
         }
     });
-
-    // 3. First corner (3p + k) of every vertex that did not move.
-    SE_ASSERT(triangleCount * 3 < kMovedFlag);
-    const u32* const triangles = m_triangles.data();
-    core::parallelFor(&jobs, triangleCount, kParallelTriangleBlock, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t p = begin; p < end; ++p) {
-            const Mesh::Triangle& c = corners[triangles[p]];
-            for (u32 k = 0; k < 3; ++k) {
-                u32& slot = stamp[c[k]];
-                // Moved stamps are stable now; reading one racing with another
-                // corner's atomicMin on a one-ring vertex is through atomic_ref.
-                const u32 current = std::atomic_ref<u32>(slot).load(std::memory_order_relaxed);
-                if (current != kNoStamp && (current & kMovedFlag) != 0) {
-                    continue; // moved
-                }
-                atomicMin(slot, static_cast<u32>(3 * p + k));
-            }
-        }
-    });
-
-    // 4. Per block of triangles: the one-ring vertices first seen there.
-    const std::size_t triangleBlocks = (triangleCount + kParallelTriangleBlock - 1) / kParallelTriangleBlock;
-    if (m_blocks.size() < triangleBlocks) {
-        m_blocks.resize(triangleBlocks);
-    }
-    core::parallelFor(&jobs, triangleBlocks, 1, [&](std::size_t first, std::size_t last) {
-        for (std::size_t b = first; b < last; ++b) {
-            Block& block = m_blocks[b];
-            block.ring.clear();
-            const std::size_t end = std::min(triangleCount, (b + 1) * kParallelTriangleBlock);
-            for (std::size_t p = b * kParallelTriangleBlock; p < end; ++p) {
-                const Mesh::Triangle& c = corners[triangles[p]];
-                for (u32 k = 0; k < 3; ++k) {
-                    if (stamp[c[k]] == static_cast<u32>(3 * p + k)) {
-                        block.ring.push_back(c[k]);
-                    }
-                }
-            }
-        }
-    });
-    m_offsets.resize(triangleBlocks + 1);
-    m_offsets[0] = movedUnique;
-    for (std::size_t b = 0; b < triangleBlocks; ++b) {
-        m_offsets[b + 1] = m_offsets[b] + m_blocks[b].ring.size();
-    }
-    const std::size_t vertexCount = m_offsets[triangleBlocks];
-    core::parallelFor(&jobs, triangleBlocks, 1, [&](std::size_t first, std::size_t last) {
-        for (std::size_t b = first; b < last; ++b) {
-            const Block& block = m_blocks[b];
-            std::copy(block.ring.begin(), block.ring.end(), m_vertices.begin() + static_cast<std::ptrdiff_t>(m_offsets[b]));
-        }
-    });
+    g_steps.ms[3] += step.elapsedMs();
+    step.reset();
 
     // 5. Every stamped vertex is in the list once: reset them for the next call.
     const u32* const vertices = m_vertices.data();
@@ -223,6 +251,8 @@ void EditRegion::collectParallel(const Mesh& mesh, std::span<const VertexId> mov
             stamp[vertices[i]] = kNoStamp;
         }
     });
+    g_steps.ms[4] += step.elapsedMs();
+    ++g_steps.calls;
     m_triangleCount = triangleCount;
     m_vertexCount = vertexCount;
 }
@@ -283,9 +313,10 @@ std::size_t EditRegion::memoryBytes() const noexcept
 {
     std::size_t bytes = (m_triangleBits.capacity() + m_vertexBits.capacity()) * sizeof(u64) +
                         m_triangles.capacity() * sizeof(TriangleId) + m_vertices.capacity() * sizeof(VertexId) +
-                        m_blocks.capacity() * sizeof(Block) + m_offsets.capacity() * sizeof(std::size_t);
+                        m_blocks.capacity() * sizeof(Block) +
+                        (m_offsets.capacity() + m_movedAt.capacity() + m_ringAt.capacity()) * sizeof(std::size_t);
     for (const Block& block : m_blocks) {
-        bytes += (block.moved.capacity() + block.triangles.capacity() + block.ring.capacity()) * sizeof(u32);
+        bytes += (block.moved.capacity() + block.triangles.capacity() + block.ring.capacity() + block.candidates.capacity()) * sizeof(u32);
     }
     return bytes;
 }

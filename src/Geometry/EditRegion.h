@@ -36,8 +36,6 @@ public:
     static constexpr std::size_t kParallelMinVertices = 16384;
     /// Moved vertices per task in the parallel triangle walk.
     static constexpr std::size_t kParallelVertexBlock = 2048;
-    /// Region triangles per task in the parallel one-ring walk.
-    static constexpr std::size_t kParallelTriangleBlock = 4096;
 
     /// Replaces the lists with those of `movedVertices`. Not thread-safe; a
     /// job system with helpers lets large edits run on them.
@@ -49,6 +47,16 @@ public:
     /// the threads that have run it (one array per thread, shared by every
     /// EditRegion on that thread, 4 bytes per vertex of the largest mesh).
     [[nodiscard]] static std::size_t parallelStampBytes() noexcept;
+    /// Profiling: wall time of each step of the parallel walk, summed over the
+    /// calls since resetParallelSteps(): stamp moved vertices, rows (triangles
+    /// and one-ring candidates), join triangles and keep the one-ring, join
+    /// vertices, reset stamps. Written by the walking thread only.
+    struct ParallelSteps {
+        double ms[5] = {};
+        u64 calls = 0;
+    };
+    [[nodiscard]] static ParallelSteps parallelSteps() noexcept;
+    static void resetParallelSteps() noexcept;
 
     [[nodiscard]] std::span<const TriangleId> triangles() const noexcept { return {m_triangles.data(), m_triangleCount}; }
     [[nodiscard]] std::span<const VertexId> vertices() const noexcept { return {m_vertices.data(), m_vertexCount}; }
@@ -64,11 +72,15 @@ private:
     /// Per task of the parallel walk: what it found, in order.
     struct Block {
         std::vector<u32> moved;     ///< moved vertices at their first occurrence
-        std::vector<u32> triangles; ///< triangles whose earliest moved corner is in this block
+        std::vector<u32> triangles; ///< triangles whose earliest moved corner is in this block (first triangleCount)
+        std::size_t triangleCount = 0;
+        std::vector<u32> candidates; ///< one-ring corners of those triangles in order, as (vertex, row) pairs
         std::vector<u32> ring;      ///< one-ring vertices first seen in this block's triangles
     };
     std::vector<Block> m_blocks;
-    std::vector<std::size_t> m_offsets;
+    std::vector<std::size_t> m_offsets; ///< per block: first triangle
+    std::vector<std::size_t> m_movedAt; ///< per block: first moved vertex in vertices()
+    std::vector<std::size_t> m_ringAt;  ///< per block: first one-ring vertex in vertices()
     bool m_lastParallel = false;
 
     std::vector<u64> m_triangleBits;
