@@ -1316,3 +1316,17 @@ tests/            GoogleTest suites (GeometryTests, SculptTests)
 tools/Bench/      headless benchmark
 docs/
 ```
+
+## License
+
+Copyright (C) 2026 NicolasDCX
+
+SculptEngine is free software, licensed under the [GNU General Public License v3.0](LICENSE). You may use, study, modify and redistribute it, provided that any distributed work based on it is also released under the GPL-3.0 with its source code.
+
+### Commercial licensing
+
+If you want to use SculptEngine in a closed-source or proprietary product without the GPL's obligations, a separate commercial license is available. Contact the author through [GitHub](https://github.com/NicolasDCX).
+
+### Contributions
+
+To keep dual licensing possible, contributions are accepted only if the contributor agrees that the author may distribute them under both the GPL-3.0 and commercial licenses.
