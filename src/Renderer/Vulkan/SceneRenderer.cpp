@@ -4,11 +4,13 @@
 #include "Core/JobSystem.h"
 #include "Geometry/ChunkLod.h"
 #include "Core/Log.h"
+#include "Core/ProcessClock.h"
 #include "Core/Timer.h"
 #include "Renderer/Frustum.h"
 
 #include <QVulkanFunctions>
 
+#include <glm/common.hpp>
 #include <glm/geometric.hpp>
 
 #include <algorithm>
@@ -51,6 +53,9 @@ SceneRenderer::SceneRenderer(QVulkanWindow* window, RenderScene* scene, RenderSt
 
 void SceneRenderer::initResources()
 {
+    if (m_stats != nullptr && m_stats->initResourcesStartProcessMs == 0.0) {
+        m_stats->initResourcesStartProcessMs = core::processUptimeMs();
+    }
     SE_ASSERT(m_scene->mesh != nullptr && m_scene->camera != nullptr);
     const RenderSettings& settings = m_scene->settings;
 
@@ -163,7 +168,11 @@ void SceneRenderer::initResources()
         if (m_residentBuffers.holdsWholeMesh()) {
             const core::Stopwatch fillTimer;
             m_residentBuffers.uploadAll(mesh, m_chunkMap);
-            core::logInfo("  whole mesh uploaded in {:.1f} ms", fillTimer.elapsedMs());
+            const double fillMs = fillTimer.elapsedMs();
+            core::logInfo("  whole mesh uploaded in {:.1f} ms", fillMs);
+            if (m_stats != nullptr) {
+                m_stats->initialUploadMs = fillMs;
+            }
         }
         // Fresh pools hold current data or nothing, so earlier pending edits are covered.
         if (m_scene->pendingVertexUpdates != nullptr) {
@@ -323,7 +332,9 @@ void SceneRenderer::startNextFrame()
     const BrushCursor& cursor = m_scene->cursor;
     constants.brushSphere = glm::vec4(cursor.center, cursor.visible ? cursor.radius : 0.0f);
     constants.brushColor = cursor.color;
-    constants.params = glm::uvec4(m_chunkMap.gpuPageShift(), 0u, 0u, 0u);
+    const glm::vec3 light = m_scene->settings.inspectionLight;
+    constants.params = glm::uvec4(m_chunkMap.gpuPageShift(), glm::floatBitsToUint(light.x), glm::floatBitsToUint(light.y),
+                                  glm::floatBitsToUint(light.z));
 
     // 1. Everything that reads the mesh happens under one lock: taking the
     //    pending edits, reading chunk bounds and copying data. The buffers
@@ -510,6 +521,9 @@ void SceneRenderer::startNextFrame()
             stats.lastGpuMs = *gpuMs;
         }
         ++stats.frameCount;
+        if (stats.frameCount == 1) {
+            stats.firstFrameProcessMs = core::processUptimeMs();
+        }
         if (stats.recordSamples) {
             stats.frameCpuSamplesMs.push_back(static_cast<float>(stats.lastFrameCpuMs));
             stats.lockWaitSamplesMs.push_back(static_cast<float>(lockWaitMs));

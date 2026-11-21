@@ -9,6 +9,7 @@ layout(push_constant) uniform FrameConstants {
     vec4 brushSphere;
     vec4 brushColor;
     uvec4 params;       // x: log2 of the GPU vertex page size (used by mesh_paged.vert)
+                        // yzw: inspection light direction as float bits (all 0: editor lighting)
 } frame;
 
 layout(location = 0) out vec4 outColor;
@@ -33,6 +34,12 @@ void main()
     // Soft specular highlight from the key light.
     vec3 halfVector = normalize(kKeyDirection + toEye);
     color += vec3(0.16) * pow(max(dot(normal, halfVector), 0.0), 48.0);
+
+    // Test support: one (grazing) light only, so small relief is visible.
+    if ((frame.params.y | frame.params.z | frame.params.w) != 0u) {
+        vec3 light = normalize(uintBitsToFloat(frame.params.yzw));
+        color = kClay * (0.06 + 1.25 * max(dot(normal, light), 0.0));
+    }
 
     // Brush cursor: the intersection of the brush sphere with the surface,
     // drawn as an anti-aliased ring plus a faint tint of the influence area.

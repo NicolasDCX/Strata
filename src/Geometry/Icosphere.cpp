@@ -21,7 +21,8 @@ constexpr std::array<u32, 60> kIcosahedronIndices = {
 
 } // namespace
 
-Mesh makeIcosphere(int subdivisions, float radius, VertexOrder order, const MeshLayout& layout)
+void generateIcosphereArrays(int subdivisions, float radius, VertexOrder order, std::vector<glm::vec3>& outPositions,
+                             std::vector<u32>& outIndices)
 {
     subdivisions = std::clamp(subdivisions, 0, kMaxIcosphereSubdivisions);
 
@@ -74,6 +75,15 @@ Mesh makeIcosphere(int subdivisions, float radius, VertexOrder order, const Mesh
     if (order == VertexOrder::Spatial) {
         sortSpatially(positions, indices);
     }
+    outPositions = std::move(positions);
+    outIndices = std::move(indices);
+}
+
+Mesh makeIcosphere(int subdivisions, float radius, VertexOrder order, const MeshLayout& layout)
+{
+    std::vector<glm::vec3> positions;
+    std::vector<u32> indices;
+    generateIcosphereArrays(subdivisions, radius, order, positions, indices);
     return Mesh(std::move(positions), std::move(indices), layout);
 }
 

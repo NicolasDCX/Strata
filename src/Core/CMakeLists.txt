@@ -8,6 +8,8 @@ add_library(se_core STATIC
     JobSystem.h
     Log.cpp
     Log.h
+    ProcessClock.cpp
+    ProcessClock.h
     Timer.h
     Types.h)
 

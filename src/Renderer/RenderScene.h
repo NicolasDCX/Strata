@@ -77,6 +77,11 @@ struct RenderSettings {
     /// strong deformation much worse than single chunks, whose dense locked
     /// borders keep many exact vertices (see the coarse-fallback notes).
     u32 coarseGroupShift = 0;
+    /// Test support (shading inspection): when non-zero, the mesh is lit by
+    /// this one world-space direction only (no camera fill, no specular, little
+    /// ambient), so a grazing direction shows small relief. Zero: the editor's
+    /// lighting. May be changed at any time.
+    glm::vec3 inspectionLight{0.0f};
     /// Triangles kept per group by the coarse fallback (border-locked; the
     /// border bounds how far it can go: single chunks end near 1/16 anyway).
     float coarseRatio = 1.0f / 16.0f;
@@ -150,6 +155,12 @@ struct RenderStats {
     double lastMeshLockWaitMs = 0.0;  ///< Time the last frame waited for `meshLock`.
     double worstMeshLockWaitMs = 0.0; ///< Longest such wait so far.
     u64 frameCount = 0;
+    /// Process uptime (core::processUptimeMs) when the first frame was submitted.
+    double firstFrameProcessMs = 0.0;
+    /// Process uptime when the renderer started creating its resources (pools, pipelines).
+    double initResourcesStartProcessMs = 0.0;
+    /// Whole-mesh upload when the pools hold the whole mesh (in initResources).
+    double initialUploadMs = 0.0;
 
     u32 chunkCount = 0;
     u32 chunksVisible = 0;      ///< chunks that passed culling (all, when culling is off)

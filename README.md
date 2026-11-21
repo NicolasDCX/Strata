@@ -118,6 +118,7 @@ cmake --build --preset release
 | `--move-updates <latest\|all>` | Move updates queued behind the one being applied: only the newest that changes anything is applied (`latest`, default), or every one (`all`). Same final mesh, undo record, dirty pages and (once idle) BVH and cones; only intermediate frames are skipped. See "Latest-wins Move updates" |
 | `--region-overlap <on\|off>` | With `--dab-prepare overlap`: walk each dab's edit region and queue its BVH leaves at the same time as the undo record, average normal and page staging (`on`), or after the brush (`off`, default). Same results bit for bit; see "Large-brush Draw and Smooth at 84M" |
 | `--smooth-kernel <quadratic\|trilinear>` | Blend of Smooth's dense-mode kernel cells: quadratic B-spline over 3x3x3 cells (`quadratic`, default) or the former trilinear blend over 2x2x2 cells (`trilinear`), which creases the surface along the cell planes and leaves angular bands along strokes; see "Smooth bands: kernel-cell creases" |
+| `--smooth-dense <n>` | Average vertices per kernel cell from which a Smooth dab uses the dense-mode filter instead of Laplacian passes (default 4; 12 before "Smooth strength across mesh resolutions") |
 | `--smooth-binning <parallel\|serial>` | Smooth's kernel grid for dabs of 32K vertices or more: binned on the helper threads, each cell summed in list order (`parallel`, default; 4 bytes per dab vertex), or on the sculpt thread (`serial`). Same results bit for bit; see "Smooth profile at 84M and parallel kernel-grid binning" |
 | `--cone-normals <reuse\|recompute>` | Exact normal cones keep each face normal of their first pass in a per-thread scratch and reuse it in the second (`reuse`, default; 64 KiB per thread), or compute it again (`recompute`). Same cones bit for bit; see "Face normals reused in exact cones" |
 | `--history-normals <before\|under>` | Undo and redo compute the new normals before taking the document lock, from the history entry's positions staged over the mesh (`before`, opt-in), or under it (`under`, default). Same results bit for bit; shorter lock hold, longer total. See "Undo and redo: normals before the lock" |
@@ -135,7 +136,7 @@ cmake --build --preset release
 | `--max-upload <MiB>` | Most mesh data copied to the GPU in one frame (the initial fill of whole-mesh pools is not limited). Default 32 |
 | `--selftest <dir>` | Run the scripted smoke test, write screenshots and `report.txt` to `<dir>`, exit 0 on success |
 | `--frame-on-commit on\|off` | Render a frame as soon as an edit is published (`on`), or request one and let Qt deliver the request from its timer (`off`, default). Measured: no net latency gain; the frames then wait for the swap chain and delay input ("Input to frame in the Vulkan viewport at 84M") |
-| `--selftest-scenario <name>` | `standard` (default), `pressure` (fixed views, camera motion, live sculpting, undo/redo; meant to run under a small budget) `history` (repeated undo/redo of typical and strong strokes while frames render back to back; reports the renderer's lock wait, the commands' hold and total, and the scratch), `move`, `smooth` or `latency` (one Draw and one Smooth stroke at radius 0.25 with 120 Hz scripted input; each dab-producing input is linked to its commit and to the first frame that took it; writes `trace_draw.csv` and `trace_smooth.csv`) |
+| `--selftest-scenario <name>` | `standard` (default), `pressure` (fixed views, camera motion, live sculpting, undo/redo; meant to run under a small budget) `history` (repeated undo/redo of typical and strong strokes while frames render back to back; reports the renderer's lock wait, the commands' hold and total, and the scratch), `move`, `smooth`, `latency` (one Draw and one Smooth stroke at radius 0.25 with 120 Hz scripted input; each dab-producing input is linked to its commit and to the first frame that took it; writes `trace_draw.csv` and `trace_smooth.csv`) or `smoothfeel` (Smooth along half of a bumpy Draw ridge from world-space rays, so the same stroke at every level; grazing-light close-ups before, after one pass and after five, with a crest height profile and Smooth's dense/sparse dab count) |
 | `--selftest-reference <dir>` | Compare the deterministic captures of this run with an earlier run in `<dir>` (only where every visible chunk is drawn) |
 
 ## Tests
@@ -1065,6 +1066,104 @@ Undo and redo (`history`, 84M, 11 helpers, typical strokes, p50 per step): the r
 
 **Adopted.** The parallel walk is replaced in place (no option): with 11 helpers the region is 1.4 times faster at 84M in both rounds and for all three brushes and undo/redo, results are bit-identical, and memory goes down. At 21M the dab difference is within the noise between rounds. Without helpers nothing changes.
 
+### Vertex gather: test only each block's candidates (adopted)
+
+Measured source: `b1de3fb` plus the uncommitted work.
+
+**Where selection spends its time** (parallel gather, 84M, radius 0.25, `se_bench adjacency 11 11 pgather pmark pregion pprep nooreg`, ms per dab). The gather is query 1.9–2.4, select 3.0–3.6, and an overlapped preparation of 2.3–2.5. Selection has three steps:
+1. **First corners, 1.0–1.2 ms.** This finds each vertex's first occurrence: an atomic minimum of the corner index per vertex over the ~3.6M corners of about 1.2M triangles. It is about a third of the selection.
+2. **Test, 1.5–1.8 ms, the largest step.** It walks all the corners again, re-reading each triangle and each vertex's slot, only to find the corners that are first occurrences. It then tests their distance.
+3. **Join and reset, 0.4–0.7 ms.**
+
+**Change.** The first step now runs block by block (2,048 triangles). When a block lowers a vertex's slot, it keeps that vertex and the corner as a candidate.
+- Within a block corners only grow, so a block lowers each slot at most once, and its candidates come out in corner order.
+- The block that holds a vertex's first corner always keeps it.
+- The test step then checks only those candidates. A candidate is a first occurrence if the slot still holds its corner.
+- So the test step no longer re-reads the triangles. The vertex order, the distance arithmetic and the falloff weights are unchanged. The serial path (fewer than 32,768 triangles) is unchanged.
+
+**Exactness.**
+- Draw, Smooth and Move hashes are identical to the baseline in every run: 6 headless runs at 84M, 12 at 21M and 6 viewport runs.
+- The parallel-gather tests pass: bit-identical to the serial gather at 0, 1, 3 and 11 helpers, with undo and redo. All 211 tests pass.
+- `se_bench repeat 9 11 draw|smooth 0.25 2`: after each undo, 0 positions and 0 normals differ from startup.
+
+**Headless screen** (84M, radius 0.25, 3 alternating rounds, base / candidate, ms per dab):
+
+| | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| Draw select (first, test) | 3.56 (1.08, 1.83) / 2.64 (1.21, 0.92) | 3.56 (1.09, 1.81) / 2.77 (1.22, 0.94) | 3.05 (1.02, 1.50) / 2.96 (1.29, 1.03) |
+| Smooth select (first, test) | 3.45 (1.16, 1.74) / 2.40 (1.26, 0.78) | 3.49 (1.18, 1.79) / 2.67 (1.33, 0.88) | 3.04 (1.11, 1.55) / 2.75 (1.33, 0.88) |
+| Draw / Smooth gather | 8.59 / 7.88 → 7.58 / 6.66 | 8.57 / 7.90 → 7.94 / 7.12 | 8.10 / 7.30 → 8.11 / 7.13 |
+
+- **The test step halves in every round** (1.5–1.8 → 0.8–1.0 ms).
+- **The first-corner step costs 0.1–0.3 ms more**, for pushing the candidates.
+- **Net selection gain: 0.8–1.05 ms in rounds 1–2.** In round 3 the baseline ran in the machine's faster state, and the gain was 0.1–0.3 ms.
+- **Whole-dab totals (23–30 ms) stay within run-to-run variation.**
+
+**Viewport trace** (84M, radius 0.25, input posted from a producer thread at 120 Hz, `--frame-on-commit off`, runs in the order base, cand, cand, base, base, cand). Dab-producing inputs, press excluded: Draw 44 per run, Smooth 33. All checks pass in all runs. The stroke hashes are the same in every run: Draw `68f2e6a3acf6dc6e`, Smooth `84e5593ed31cd301`. Endpoint: submission.
+
+| p50 / p95 ms | Draw queued → commit | Draw posted → submission | Smooth queued → commit | Smooth posted → submission |
+|---|---|---|---|---|
+| base (runs 1, 4, 5) | 20.93 / 24.10 · 20.77 / 23.96 · 20.63 / 23.61 | 28.19 / 38.75 · 28.70 / 42.00 · 28.02 / 40.51 | 33.13 / 37.82 · 33.27 / 37.97 · 33.11 / 37.60 | 43.06 / 53.57 · 41.50 / 56.14 · 42.25 / 51.21 |
+| candidate (runs 2, 3, 6) | 20.48 / 23.71 · 20.45 / 23.29 · 20.22 / 23.23 | 29.00 / 45.40 · 29.20 / 40.24 · 29.47 / 38.23 | 31.88 / 37.48 · 32.29 / 36.00 · 31.75 / 36.32 | 40.90 / 53.70 · 39.51 / 49.83 · 40.52 / 50.97 |
+| gather per dab (stage timers) | Draw 8.51–8.56 → 7.89–8.01 | | Smooth 9.36–9.55 → 8.69–8.81 | |
+
+- **Gather and commit are consistently earlier.** The viewport gather is 0.6–0.7 ms shorter in every run.
+  - Draw: queued → commit is 0.3–0.5 ms lower at p50, and lower at p95 in every pairing.
+  - Smooth: queued → commit is 1.0–1.4 ms lower at p50.
+- **Visible effect is mixed.**
+  - Smooth's posted → submission p50 is 1.5–2 ms lower.
+  - Draw's p50 is 0.3–1.4 ms higher, which is noise from the 0–16 ms wait for the next frame. A 0.4 ms earlier commit can't show through that.
+  - Neither brush is visibly faster at p95.
+
+**21M, smaller brushes** (`adjacency 10 11 ... r=0.125` and `r=0.0625`, 3 alternating rounds; hashes identical in all).
+- **Radius 0.125** takes the changed parallel path (about 82K triangles). The machine switched state during the runs, so compare runs in the same state:
+  - Fast state: select 0.298–0.306 → 0.259 ms.
+  - Slow state: 0.433 → 0.343–0.386 ms.
+  - No regression.
+- **Radius 0.0625** queries about 20K triangles and takes the unchanged serial path: select 0.150–0.187 ms in both versions.
+
+**Extra scratch.** The candidate lists keep their capacity, which `StrokeProcessor::gatherCandidateBytes()` reports and `se_bench adjacency` prints:
+- 84M, radius 0.25: 10.2 MiB, out of 26.8 MiB of gather scratch.
+- 21M, radius 0.125: 0.67 MiB.
+
+**Verdict: adopted** as the parallel gather's selection, with no switch. Results are identical and the commit is consistently earlier. The cost is about 10 MiB at 84M. The visible gain is below the frame-wait noise.
+
+### Reusing face normals within a dab (measured, reverted)
+
+Measured source: `b1de3fb` plus the uncommitted work.
+
+**Idea.** The normal update sums, for each affected vertex (the moved vertices and their one-ring), the cross product of every incident triangle. So each triangle's face normal is computed once per corner, about 3 times. The prototype computed each face normal once and reused it:
+1. Mark the triangle pages that hold the dab's triangles (those with a moved corner) and give each page a slot.
+2. Compute every such triangle's face normal once, from the staged positions, with the same expression. Store it in the slot, and set a bit per triangle.
+3. For each affected vertex, sum its incident triangles in the existing row order. Take the stored normal where its bit is set. Compute faces with no moved corner (the brush boundary) in place, as before.
+
+**Exactness.** Results were bit-identical:
+- Draw, Smooth and Move headless hashes at 84M were identical to the baseline in all 6 runs (`738f223307025da3`, `7e12edabb0689a9e`, `585eba3231cbc28f`).
+- Two temporary tests passed:
+  - Per dab: positions and normals, plus the undo records, were bit-identical with reuse on and off, at 0, 1, 3 and 11 helpers.
+  - Undo and redo: the mesh hash after every stroke, undo and redo through `AppController` was identical.
+
+**Headless A/B** (84M, radius 0.25, `se_bench adjacency 11 11 pgather pmark pregion pprep nooreg [facereuse]`, same binary, 3 alternating rounds, current / prototype, ms per dab):
+
+| | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| Draw normal compute (CPU) | 2.37 (25.1) / 3.96 (38.6) | 2.48 (26.2) / 4.82 (48.1) | 3.08 (33.4) / 4.83 (48.2) |
+| Smooth normal compute (CPU) | 2.02 (21.9) / 3.33 (33.6) | 2.08 (22.5) / 4.12 (42.3) | 2.66 (29.3) / 4.10 (42.2) |
+| Draw whole dab | 19.97 / 21.63 | 20.43 / 24.63 | 22.67 / 24.81 |
+| Smooth whole dab | 23.32 / 25.21 | 23.85 / 28.77 | 27.03 / 28.86 |
+
+- **The prototype is slower in every round.**
+  - Normal compute is 1.3–2.3 ms more wall time (per vertex 40–54 → 60–77 ns of CPU).
+  - The whole dab is 1.7–4.9 ms more, well beyond run-to-run variation.
+  - Move, which shares the path, is 1.4–1.9 ms slower in normal compute.
+- **Extra scratch: 34.1 MiB** at 84M. That is the face-normal cache for about 1.2M triangles over the pages they touch, the per-triangle bits and the 80 KiB page-slot table.
+- **Why it loses (inferred, not profiled):**
+  - The per-corner cross product is cheap. Its three positions are the vertex's neighbours, already in cache from the one-ring walk.
+  - The prototype replaces it with an extra pass that stores 12 bytes and sets an atomic bit per triangle. Each later lookup then reads a page slot, a bit word and the stored normal, from a cache spread across about 34 MiB.
+  - That memory traffic costs more than the arithmetic it saves.
+
+**Verdict: reverted.** By the experiment's rule, the viewport trace was not run. The per-corner computation stays.
+
 ### Input to frame in the Vulkan viewport at 84M (measured)
 
 Measured source: `cb4bf67` plus the uncommitted work. Command: `SculptEngine --subdivisions 11 --region-overlap off --selftest-scenario latency --selftest <dir>`, 3 runs.
@@ -1117,7 +1216,7 @@ The Draw maximum, 55.7–61.4 ms queued → commit, is the press's dab every tim
   - Qt then delivers `UpdateRequest` on a fixed grid of about 15.6 ms (frame intervals p50 15.5–15.8 ms, sometimes 31 ms). Once it arrives, `startNextFrame` runs 0.05 ms later, so acquire and fence waits are negligible.
   - The `UpdateRequest` times and the scripted input timer share the same phase modulo 15.625 ms. This is consistent with both being Qt timers on Windows' default 15.625 ms timer tick, rather than with vsync. That cause is inferred, not verified.
   - The wait for this tick is 0–16 ms, uniform. That is the p50 of about 10 ms and the p95 of about 13–16 ms.
-- **Harness limitation.** The scripted input runs on the same Qt timer. It reaches `pointerMove` on that grid, 7.5 ms p50 (14.5 p95) after its 120 Hz schedule, often two moves at once. The table starts at enqueue, so this lag is not in it. Real mouse events arrive as window messages, not timers.
+- **Harness limitation (these runs; since fixed).** The scripted input ran on the same Qt timer. It reached `pointerMove` on that grid, 7.5 ms p50 (14.5 p95) after its 120 Hz schedule, often two moves at once. The table starts at enqueue, so this lag is not in it. The scenario now posts its input from a producer thread instead; see "Input independent of Qt's timer" below.
 
 **Stage timers per dab in the viewport** (`InteractionStats::strokeStages`, runs 2 and 3, ms):
 
@@ -1193,6 +1292,42 @@ To shorten commit → frame without blocking input, a frame must not be started 
 - move rendering off the GUI thread.
 
 Each needs real presentation feedback (`VK_KHR_present_wait` or similar), which is not wired in.
+
+**Input independent of Qt's timer** (producer thread; 84M; 3 runs per mode in the order off, on, on, off, off, on).
+- **How the input is produced now.** The latency scenario's input comes from a worker thread:
+  - It sleeps on a high-resolution waitable timer until each 120 Hz slot.
+  - It then posts a timestamped pointer event to the viewport through Qt's event queue (`QCoreApplication::postEvent`): the press, 240 moves, then the release.
+  - On the GUI thread, an event filter on the viewport records when each event is handled, then calls the viewport's pointer handler.
+  - During the stroke the filter also swallows and counts the window system's own mouse events, so only scripted input reaches the stroke.
+- **Three times per input:** scheduled, posted (just before `postEvent`) and handled.
+  - Scheduled → posted is the producer's jitter.
+  - Posted → handled is how long the event waited for the GUI thread.
+- **Endpoint: submission.** That is `frameReady()` returning, by which point the queue submit and present request have been issued. It is not presentation.
+- **Checks, all passing in all 6 runs:**
+  - 241 input samples per stroke (press + 240 moves).
+  - All 242 posted events handled once, in order; 0 window-system mouse events swallowed.
+  - Every dab-producing input reached a frame: Draw 45 per run (44 without the press), Smooth 34 (33).
+  - The same mesh hash after each stroke in every run and mode: Draw `68f2e6a3acf6dc6e`, Smooth `84e5593ed31cd301`.
+
+| dab-producing inputs, press excluded, p50 / p95 ms (pooled, 3 runs per mode) | Draw off (132) | Draw on (132) | Smooth off (99) | Smooth on (99) |
+|---|---|---|---|---|
+| scheduled → posted (producer jitter) | 0.25 / 0.48 | 0.26 / 0.51 | 0.23 / 0.51 | 0.21 / 0.51 |
+| **posted → GUI handler** | **0.04 / 3.03** | **14.89 / 31.92** | **0.04 / 0.89** | **11.84 / 27.43** |
+| input queued → commit | 20.84 / 24.27 | 20.83 / 25.82 | 33.02 / 37.70 | 32.00 / 38.40 |
+| commit → frame took the edit | 4.00 / 12.14 | 9.94 / 12.79 | 4.81 / 16.03 | 1.98 / 11.61 |
+| frame took it → submission | 2.80 / 3.04 | 2.84 / 3.51 | 2.91 / 3.16 | 2.88 / 3.18 |
+| **posted → submission** | **28.73 / 37.68** | **49.24 / 67.54** | **41.32 / 52.51** | **53.67 / 69.35** |
+
+Per run, posted → submission p50 (p95):
+- **Draw off:** 28.4 (37.3), 29.0 (37.2), 27.8 (40.4). **Draw on:** 49.1 (65.0), 51.6 (68.6), 43.0 (67.4).
+- **Smooth off:** 40.5 (52.0), 41.8 (52.7), 43.2 (51.2). **Smooth on:** 53.9 (67.7), 53.7 (79.4), 49.4 (65.5).
+
+- **Immediate rendering hurts consistently.** In every `on` run, posted → submission is 12–23 ms worse at p50 and 13–28 ms worse at p95 than every `off` run.
+- **The cause is the blocked GUI thread.** Each commit's frame waits in `beginFrame` for a swap-chain image, 11–25 ms p50. During that wait, posted input sits in the queue: posted → handler goes from 0.04 ms to 12–15 ms at p50. That costs more than the shorter commit → frame time saves, and for Draw commit → frame is not even shorter.
+- **The producer is not the problem.** Its jitter is under 0.5 ms at p95 in both modes.
+- **With `off`, the frame side is small.** Input that arrives independently of Qt's timer no longer lines up with Qt's frame ticks, so commit → frame is 4.0–4.8 ms p50 (12–16 ms p95), against about 10 ms p50 with the timer-driven harness. Including recording and submission, the frame side is about 7 ms p50 out of 29 ms (Draw) or 41 ms (Smooth). The rest is before commit: 21 and 33 ms.
+
+**Verdict on frame scheduling.** It does not deserve another experiment now. A non-blocking scheduler could at best remove the 4–5 ms p50 (12–16 ms p95) commit → frame wait. Such a scheduler would render on commit only when a swap-chain image is free, and it needs presentation feedback first. Blocking the GUI thread, as `--frame-on-commit on` does, makes latency worse. Default stays off. Draw's gather and normals and Smooth's brush and gather are 20–33 ms before commit, which is where the next gains are.
 
 ### Rates repeatability and what "visible" measures (benchmark fix)
 
@@ -1332,6 +1467,40 @@ Measured source: `cb4bf67` plus the uncommitted work. Both blends ran from the s
 The kernel pass reads 27 cells instead of 8 and is about 1.7 times slower: +0.5 ms per dab at 21M and +1.9 ms at 84M, about 8% of a Smooth edit. Binning and the Laplacian pass are unchanged. Each mode's mesh hash is the same in both rounds.
 
 **Adopted** as the default for correctness. `--smooth-kernel trilinear` (`strilinear` in `se_bench`) restores the old blend for comparison. A cheaper evaluation, such as per-cell normalised normals computed once per dab, is left for the performance work.
+
+### Smooth strength across mesh resolutions (fix, default)
+
+Measured source: `b1de3fb` plus the uncommitted work.
+
+**Check.** `SculptEngine --subdivisions <n> --selftest-scenario smoothfeel --selftest <dir>`:
+1. A broad ridge is drawn along X on the front of the sphere (Draw, radius 0.3, strength 0.5), with 7 small bumps on its crest (radius 0.08, 3 dabs each).
+2. Smooth then runs along the +X half (x > 0.1; radius 0.3, strength 0.5): one pass, then four more back and forth.
+3. Every stroke is a fixed world-space ray, so the path, radius and strength are the same at every level.
+4. The scenario captures one close-up per stage under two grazing lights (an opt-in single-light mode of the mesh shader, `RenderSettings::inspectionLight`) and the editor's lighting. It notes the crest height every 0.05 along X, and how many Smooth dabs ran in dense mode.
+
+**What it showed.**
+- **No visible defect from Smooth at either resolution.** The bumps soften after one pass and are gone after five. The smoothed half blends into the untouched half without a step. Even with a contrast stretch, no diagonal bands appear at 81,920 or 21M triangles.
+- **One pass smoothed about twice as much at 21M as at the default mesh.** Crest height at x = 0.45 (0.13 before):
+
+| | default mesh (L6) | L7 | L8 | L9 | 21M (L10) |
+|---|---|---|---|---|---|
+| dense dabs, first pass | 4 of 9 | 9 of 9 | 9 of 9 | 9 of 9 | 9 of 9 |
+| after 1 pass | 0.105 | 0.085 | 0.085 | 0.085 | 0.085 |
+
+**Cause.** A Smooth dab uses the dense-mode filter only when its vertices average at least `kDenseVerticesPerCell` per kernel cell (cell size 0.3 × radius). Otherwise it runs 4 × strength Laplacian passes.
+- The dense filter's reach is a fraction of the radius, so it behaves the same at L7 to L10, within ±0.001 of crest height.
+- A Laplacian pass reaches only the one-ring, a few edges, so it smooths far less at the brush's scale.
+- At 12 per cell the default mesh sits on the switch at the editor's radii: radius 0.3 is about 12 per cell and radius 0.25 about 8. Dabs along the stroke therefore flipped between the two modes, and the sparse ones hardly smoothed.
+
+**Fix.** `kDenseVerticesPerCell` is now 4 (was 12). `--smooth-dense <n>` sets it for comparisons, and `SmoothBrush::setDenseThreshold` does the same in code.
+- **Same stroke, default mesh:** all 9 dabs dense. The crest matches 21M within 0.002 after one pass (0.0814 vs 0.0833 at x = 0.45) and within 0.006 after five. The images match the 21M row.
+- **Thresholds 8, 6, 4 and 3** give identical results on this stroke (every dab already dense).
+- **Low density stays clean.** Forcing dense mode at L5, about 3 vertices per cell on this stroke, shows no lumps or cell pattern, so 4 leaves margin.
+- **Bands.** The original band scenario (`--selftest-scenario smooth`) at the default mesh, now in dense mode, passes. Reference normals render identically, undo is exact and redo is exact. The high-pass change in close-view shading stays within ±2 grey levels out of 255, which is 8-bit contouring, with either kernel blend.
+- **Unchanged:** 21M and denser meshes were already all dense. Dabs too sparse even for 4 per cell (a small radius on a coarse mesh) still use Laplacian passes, whose few-edge reach is then about the radius anyway.
+- **Tests:** all 211 pass. `BrushTest.SmoothResultDoesNotDependOnVertexOrder` checks the Laplacian pass, so it now forces sparse mode, whose result it predicts.
+
+**Also seen (not changed).** At 21M, with an extreme contrast stretch only, the Draw-only ridge shows faint overlapping arcs on its slopes. They are probably Draw's dab spacing, and they are not visible in the normal renders.
 
 ### Latest-wins Move updates (default)
 

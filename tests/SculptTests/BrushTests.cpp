@@ -195,6 +195,11 @@ TEST_F(BrushTest, SmoothResultDoesNotDependOnVertexOrder)
     bvh.refit(mesh);
     const std::vector<glm::vec3> source(mesh.positions().begin(), mesh.positions().end());
 
+    // Sparse mode (Laplacian passes only), whatever this mesh's density.
+    struct SparseOnly {
+        SparseOnly() { sculpt::SmoothBrush::setDenseThreshold(1e9f); }
+        ~SparseOnly() { sculpt::SmoothBrush::setDenseThreshold(sculpt::SmoothBrush::kDenseVerticesPerCell); }
+    } sparseOnly;
     // Strength 1 / kMaxPassesPerDab is exactly one relaxation pass.
     const BrushSettings settings{.radius = 0.6f,
                                  .strength = 1.0f / static_cast<float>(sculpt::SmoothBrush::kMaxPassesPerDab),

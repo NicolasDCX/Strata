@@ -24,6 +24,14 @@ public:
     /// Positive steps move towards the target (one step = one wheel notch).
     void zoom(float steps) noexcept;
 
+    /// Sets the orbit directly (yaw around +Y from +Z, pitch above the horizon).
+    void set(const glm::vec3& target, float distance, float yaw, float pitch) noexcept
+    {
+        m_target = target;
+        m_distance = distance;
+        m_yaw = yaw;
+        m_pitch = pitch;
+    }
     /// Centres the target on the box and backs off until it fits the view.
     void frame(const geo::Aabb& bounds) noexcept;
 

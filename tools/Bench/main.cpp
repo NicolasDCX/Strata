@@ -43,6 +43,8 @@
 #include "Geometry/DirtyVertexSet.h"
 #include "Geometry/EditRegion.h"
 #include "Geometry/Icosphere.h"
+#include "Geometry/IcosphereCache.h"
+#include "Core/ProcessClock.h"
 #include "Sculpt/BrushLibrary.h"
 #include "Sculpt/Brushes/SmoothBrush.h"
 #include "Sculpt/StrokeProcessor.h"
@@ -55,6 +57,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <vector>
 #include <mutex>
@@ -91,6 +94,9 @@ u32 g_coneFallbackPercent = 50;
 bool g_parallelRegion = false;
 /// "pprep": overlap each dab's undo record, average normal and page staging (AppConfig::overlapPrepare).
 bool g_overlapPrepare = false;
+/// "cache=DIR": load the pristine sphere from DIR, or generate it and write it
+/// there (geo::makeIcosphereCached; same mesh). Empty: generate.
+std::filesystem::path g_sphereCache;
 /// "oreg" / "nooreg": overlap the region walk and leaf marking with the
 /// preparation (AppConfig::overlapRegion), in every mode including rates;
 /// neither: each mode's default (the bench's: off; rates: the editor's).
@@ -260,7 +266,7 @@ LevelResult measure(int level, const geo::MeshLayout& layout, u32 chunkShift, co
 {
     LevelResult result;
     core::Stopwatch timer;
-    geo::Mesh mesh = geo::makeIcosphere(level, 1.0f, geo::VertexOrder::Spatial, layout);
+    geo::Mesh mesh = geo::makeIcosphereCached(g_sphereCache, level, 1.0f, geo::VertexOrder::Spatial, layout);
     result.meshMs = timer.elapsedMs();
 
     geo::ChunkedBvh bvh;
@@ -370,6 +376,7 @@ void runResponsiveness(int level, int helperThreads)
 {
     app::AppConfig config;
     config.sphereSubdivisions = level;
+    config.sphereCacheDirectory = g_sphereCache;
     config.jobThreads = helperThreads;
     const core::Stopwatch startup;
     app::AppController controller(config);
@@ -781,6 +788,7 @@ int runHistoryBench(int level, int helperThreads, int cycles, bool parallelGathe
 {
     app::AppConfig config;
     config.sphereSubdivisions = level;
+    config.sphereCacheDirectory = g_sphereCache;
     config.jobThreads = helperThreads;
     config.parallelGather = parallelGather;
     config.parallelMarking = parallelMarking;
@@ -1022,7 +1030,7 @@ void runRateStroke(app::AppController& controller, sculpt::BrushId brush, float 
 /// at the start point; otherwise a straight stroke along +x on the view plane.
 int runSmoothDump(int level, const char* outDir, int updates, float radius, float strength, int passes)
 {
-    geo::Mesh mesh = geo::makeIcosphere(level, 1.0f, geo::VertexOrder::Spatial);
+    geo::Mesh mesh = geo::makeIcosphereCached(g_sphereCache, level, 1.0f, geo::VertexOrder::Spatial);
     geo::ChunkedBvh bvh;
     auto jobs = std::make_unique<core::JobSystem>(11u);
     bvh.build(mesh, geo::ChunkedBvh::kDefaultChunkTriangleShift, jobs.get(), true);
@@ -1120,11 +1128,24 @@ int runRepeatDiag(int level, int helperThreads, sculpt::BrushId brush, float rad
 {
     app::AppConfig config;
     config.sphereSubdivisions = level;
+    config.sphereCacheDirectory = g_sphereCache;
     config.jobThreads = helperThreads;
     if (g_overlapRegion >= 0) {
         config.overlapRegion = g_overlapRegion == 1;
     }
     auto owner = std::make_unique<app::AppController>(config);
+    const auto printStartup = [](const app::AppController& c) {
+        const app::StartupStats& st = c.startupStats();
+        const geo::IcosphereCacheStats& sp = st.sphere;
+        const char* source = sp.source == geo::IcosphereSource::CacheLoaded    ? "loaded from cache"
+                             : sp.source == geo::IcosphereSource::CacheCreated ? "generated, cache written"
+                                                                               : "generated";
+        std::printf("  controller: sphere %s in %.0f ms (generate %.0f, read %.0f, checksum %.0f, write %.0f, Mesh build %.0f), "
+                    "BVH %.0f ms; ready %.0f ms after process launch; startup hash %016llx\n",
+                    source, st.meshMs, sp.generateMs, sp.readMs, sp.checksumMs, sp.writeMs, sp.buildMs, st.bvhMs,
+                    st.readyProcessMs, static_cast<unsigned long long>(hashMesh(c.mesh())));
+    };
+    printStartup(*owner);
     std::printf("repeat diag: level %d (%u triangles), %s r=%.4f, %d reps%s, overlap region %s, %s\n", level,
                 owner->mesh().triangleCount(), brush == sculpt::BrushId::Draw ? "Draw" : brush == sculpt::BrushId::Smooth ? "Smooth" : "Move",
                 static_cast<double>(radius), reps, fresh ? " (each in a new controller)" : "", config.overlapRegion ? "on" : "off",
@@ -1174,7 +1195,9 @@ int runRepeatDiag(int level, int helperThreads, sculpt::BrushId brush, float rad
     controller.setRadius(radius);
     for (int rep = 0; rep < reps; ++rep) {
         if (fresh && rep > 0) {
+            owner.reset(); // one controller at a time: 84M needs the memory
             owner = std::make_unique<app::AppController>(config);
+            printStartup(*owner);
             owner->waitUntilIdle();
             owner->setActiveBrush(brush);
             owner->setRadius(radius);
@@ -1205,6 +1228,7 @@ int runRepeatDiag(int level, int helperThreads, sculpt::BrushId brush, float rad
         run.before = copy(controller.history().undoPositions());
         run.positions = copy(controller.mesh().positions());
         run.normals = copy(controller.mesh().normals());
+        std::printf("  rep %d stroke hash %016llx\n", rep + 1, static_cast<unsigned long long>(hashMesh(controller.mesh())));
         controller.undo();
         controller.waitUntilIdle();
         double maxP = 0.0;
@@ -1258,6 +1282,7 @@ int runRatesBench(int level, int helperThreads, float surfaceSpeed, double frame
 {
     app::AppConfig config;
     config.sphereSubdivisions = level;
+    config.sphereCacheDirectory = g_sphereCache;
     config.jobThreads = helperThreads; // every other option: the editor's defaults
     if (g_moveAll || g_moveLatest) {
         config.coalesceMoveUpdates = g_moveLatest && !g_moveAll;
@@ -1298,6 +1323,7 @@ int runLiveBench(int level, int helperThreads, int rounds, bool parallelGather, 
 {
     app::AppConfig config;
     config.sphereSubdivisions = level;
+    config.sphereCacheDirectory = g_sphereCache;
     config.jobThreads = helperThreads;
     config.parallelGather = parallelGather;
     config.parallelMarking = parallelMarking;
@@ -1397,22 +1423,45 @@ int runAdjacencyBench(int level, unsigned threads, const geo::MeshLayout& layout
     const std::size_t heapBefore = bench::heapBytesInUse();
     bench::resetHeapPeak();
     core::Stopwatch timer;
-    geo::Mesh generated = geo::makeIcosphere(level, 1.0f, geo::VertexOrder::Spatial, layout);
-    const double icosphereMs = timer.elapsedMs();
-    const std::size_t icospherePeak = bench::heapPeakBytes() - heapBefore;
+    double icosphereMs = 0.0;
+    std::size_t icospherePeak = 0;
+    std::size_t flatBytes = 0;
+    double constructMs = 0.0;
+    std::size_t constructPeak = 0;
+    geo::IcosphereCacheStats cacheStats;
+    geo::Mesh mesh;
+    if (!g_sphereCache.empty()) {
+        // With the sphere cache: one pass, loaded (or generated and written) then built.
+        mesh = geo::makeIcosphereCached(g_sphereCache, level, 1.0f, geo::VertexOrder::Spatial, layout, &cacheStats);
+        icosphereMs = timer.elapsedMs();
+        icospherePeak = bench::heapPeakBytes() - heapBefore;
+        constructMs = cacheStats.buildMs;
+        constructPeak = icospherePeak;
+        const char* source = cacheStats.source == geo::IcosphereSource::CacheLoaded    ? "loaded"
+                             : cacheStats.source == geo::IcosphereSource::CacheCreated ? "generated and written"
+                                                                                       : "generated (cache write failed)";
+        std::printf("  sphere cache %s: %s; generate %.1f, read %.1f, checksum %.1f, write %.1f, Mesh build %.1f ms; file %.1f MiB%s%s\n",
+                    cacheStats.file.string().c_str(), source, cacheStats.generateMs, cacheStats.readMs, cacheStats.checksumMs,
+                    cacheStats.writeMs, cacheStats.buildMs, static_cast<double>(cacheStats.fileBytes) / kMiB,
+                    cacheStats.rejected.empty() ? "" : "; rejected existing file: ", cacheStats.rejected.c_str());
+    } else {
+        geo::Mesh generated = geo::makeIcosphere(level, 1.0f, geo::VertexOrder::Spatial, layout);
+        icosphereMs = timer.elapsedMs();
+        icospherePeak = bench::heapPeakBytes() - heapBefore;
 
-    // 2. PagedMesh construction alone, from flat arrays (what an importer hands over).
-    std::vector<glm::vec3> flatPositions(generated.vertexCount());
-    std::vector<u32> flatIndices(static_cast<std::size_t>(generated.triangleCount()) * 3);
-    generated.copyPositions(0, generated.vertexCount(), flatPositions.data());
-    generated.copyIndices(0, generated.triangleCount(), flatIndices.data());
-    generated = geo::Mesh();
-    const std::size_t flatBytes = bench::heapBytesInUse() - heapBefore;
-    bench::resetHeapPeak();
-    timer.reset();
-    geo::Mesh mesh(std::move(flatPositions), std::move(flatIndices), layout);
-    const double constructMs = timer.elapsedMs();
-    const std::size_t constructPeak = bench::heapPeakBytes() - heapBefore;
+        // 2. PagedMesh construction alone, from flat arrays (what an importer hands over).
+        std::vector<glm::vec3> flatPositions(generated.vertexCount());
+        std::vector<u32> flatIndices(static_cast<std::size_t>(generated.triangleCount()) * 3);
+        generated.copyPositions(0, generated.vertexCount(), flatPositions.data());
+        generated.copyIndices(0, generated.triangleCount(), flatIndices.data());
+        generated = geo::Mesh();
+        flatBytes = bench::heapBytesInUse() - heapBefore;
+        bench::resetHeapPeak();
+        timer.reset();
+        mesh = geo::Mesh(std::move(flatPositions), std::move(flatIndices), layout);
+        constructMs = timer.elapsedMs();
+        constructPeak = bench::heapPeakBytes() - heapBefore;
+    }
 
     std::unique_ptr<core::JobSystem> jobs = threads > 0 ? std::make_unique<core::JobSystem>(threads) : nullptr;
     geo::ChunkedBvh bvh;
@@ -1437,6 +1486,8 @@ int runAdjacencyBench(int level, unsigned threads, const geo::MeshLayout& layout
     std::printf("  PagedMesh from flat arrays: %.1f ms, peak heap %.1f MiB (flat input %.1f MiB, final mesh %.1f MiB)\n",
                 constructMs, mib(constructPeak), mib(flatBytes), mib(memory.total()));
     std::printf("  initial hash %016llx\n", static_cast<unsigned long long>(hashMesh(mesh)));
+    std::printf("  ready to sculpt %.0f ms after process launch (sphere %.0f ms, BVH %.0f ms; without the cache the bench builds the Mesh twice, see above)\n",
+                core::processUptimeMs(), icosphereMs, bvhMs);
 
     // Raw adjacency reads over a brush-sized region (the vertices of 64
     // consecutive pages, visited in a scrambled order like a BVH gather), one
@@ -1548,6 +1599,9 @@ int runAdjacencyBench(int level, unsigned threads, const geo::MeshLayout& layout
                      r.stages.gather.normalMs) / edits,
                     r.stages.gather.selectFirstMs / edits, r.stages.gather.selectTestMs / edits, r.stages.gather.selectJoinMs / edits,
                     r.stages.gather.prepareWallMs / edits, r.stages.gather.overlappedDabs, r.edits);
+        std::printf("         gather scratch %.2f MiB (candidate lists %.2f MiB)\n",
+                    static_cast<double>(stroke.parallelGatherScratchBytes()) / kMiB,
+                    static_cast<double>(stroke.gatherCandidateBytes()) / kMiB);
         std::printf("         cones per edit: CPU %.4f ms (boxes %.4f), %.2f chunks: %.2f exact, %.2f widened, %.2f culling off, %.0f widen triangles\n",
                     r.stages.refit.coneCpuMs / edits, r.stages.refit.boxCpuMs / edits, r.stages.refit.chunks / edits,
                     r.stages.refit.conesExact / edits, r.stages.refit.conesWidened / edits, r.stages.refit.conesDisabled / edits,
@@ -1624,6 +1678,9 @@ int main(int argc, char** argv)
         }
         if (std::strncmp(argv[i], "r=", 2) == 0) {
             g_dabRadius = static_cast<float>(std::atof(argv[i] + 2));
+        }
+        if (std::strncmp(argv[i], "cache=", 6) == 0) {
+            g_sphereCache = std::filesystem::path(argv[i] + 6);
         }
     }
     if (g_incrementalCones) {

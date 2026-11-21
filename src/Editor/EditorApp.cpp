@@ -5,9 +5,11 @@
 #include "Editor/MainWindow.h"
 #include "Editor/ViewportWindow.h"
 #include "Editor/SelfTest.h"
+#include "Core/ProcessClock.h"
 #include "Geometry/Icosphere.h"
 #include "Sculpt/Brushes/SmoothBrush.h"
 
+#include <filesystem>
 #include <QApplication>
 #include <QColor>
 #include <QCommandLineParser>
@@ -50,7 +52,9 @@ void applyDarkTheme(QApplication& application)
 
 int runEditor(int argc, char** argv)
 {
+    const double mainEntryMs = core::processUptimeMs();
     QApplication application(argc, argv);
+    application.setProperty("se.mainEntryMs", mainEntryMs);
     QApplication::setApplicationName(QStringLiteral("SculptEngine"));
     QApplication::setApplicationVersion(QStringLiteral("0.1.0"));
     applyDarkTheme(application);
@@ -112,6 +116,14 @@ int runEditor(int argc, char** argv)
         QStringLiteral("smooth-kernel"),
         QStringLiteral("Blend of Smooth's dense-mode kernel cells: quadratic B-spline over 3x3x3 cells (quadratic, default) or the former trilinear blend over 2x2x2 cells (trilinear), which leaves creases along the cell planes."),
         QStringLiteral("quadratic|trilinear"));
+    const QCommandLineOption smoothDenseOption(
+        QStringLiteral("smooth-dense"),
+        QStringLiteral("Average vertices per kernel cell from which a Smooth dab uses the dense-mode filter instead of Laplacian passes (default 4)."),
+        QStringLiteral("n"));
+    const QCommandLineOption sphereCacheOption(
+        QStringLiteral("sphere-cache"),
+        QStringLiteral("Directory of the pristine-sphere cache: load the sphere for --subdivisions from it if a valid file exists, else generate it and write the file there. Off by default. Same mesh bit for bit."),
+        QStringLiteral("dir"));
     const QCommandLineOption moveUpdatesOption(
         QStringLiteral("move-updates"),
         QStringLiteral("Move updates queued behind the one being applied: apply only the newest (latest, default) or every one (all). Same final mesh, undo record and BVH; only intermediate frames are skipped."),
@@ -150,7 +162,7 @@ int runEditor(int argc, char** argv)
         QStringLiteral("recompute|reuse"));
     const QCommandLineOption scenarioOption(
         QStringLiteral("selftest-scenario"),
-        QStringLiteral("Self-test script: standard (default), pressure, history (undo/redo overlapping rendering) move (live Move strokes at 500 inputs per second) smooth (Smooth shading close-ups, data dumps) or latency (120 Hz Draw and Smooth strokes traced from input to commit to the frame that took the edit)."), QStringLiteral("name"));
+        QStringLiteral("Self-test script: standard (default), pressure, history (undo/redo overlapping rendering) move (live Move strokes at 500 inputs per second) smooth (Smooth shading close-ups, data dumps) latency (120 Hz Draw and Smooth strokes traced from input to commit to the frame that took the edit) smoothfeel (Smooth along half of a bumpy Draw ridge, grazing-light close-ups) or startup (launch to ready-to-sculpt timings and the startup mesh hash, then exit)."), QStringLiteral("name"));
     const QCommandLineOption adjacencyOption(
         QStringLiteral("adjacency"),
         QStringLiteral("Storage of the mesh adjacency (neighbours, incident triangles): compact (16-bit offsets, about 58% of the wide size, default) or wide (u32 ids)."),
@@ -175,6 +187,8 @@ int runEditor(int argc, char** argv)
     parser.addOption(frameOnCommitOption);
     parser.addOption(smoothBinOption);
     parser.addOption(smoothKernelOption);
+    parser.addOption(smoothDenseOption);
+    parser.addOption(sphereCacheOption);
     parser.addOption(historyNormalsOption);
     parser.addOption(boxRefitOption);
     parser.addOption(conesOption);
@@ -222,6 +236,9 @@ int runEditor(int argc, char** argv)
         core::logWarning("Ignoring invalid --subdivisions value; using {}", config.sphereSubdivisions);
     }
 
+    if (parser.isSet(sphereCacheOption)) {
+        config.sphereCacheDirectory = std::filesystem::path(parser.value(sphereCacheOption).toStdWString());
+    }
     if (parser.isSet(threadsOption)) {
         bool threadsValid = false;
         const int threads = parser.value(threadsOption).toInt(&threadsValid);
@@ -299,6 +316,15 @@ int runEditor(int argc, char** argv)
             sculpt::SmoothBrush::setQuadraticKernel(false);
         } else {
             core::logWarning("Ignoring invalid --smooth-kernel value");
+        }
+    }
+    if (parser.isSet(smoothDenseOption)) {
+        bool valid = false;
+        const float value = parser.value(smoothDenseOption).toFloat(&valid);
+        if (valid && value > 0.0f) {
+            sculpt::SmoothBrush::setDenseThreshold(value);
+        } else {
+            core::logWarning("Ignoring invalid --smooth-dense value");
         }
     }
     if (parser.isSet(moveUpdatesOption)) {
@@ -461,6 +487,10 @@ int runEditor(int argc, char** argv)
         scenario = SelfTest::Scenario::Smooth;
     } else if (parser.value(scenarioOption).toLower() == QStringLiteral("latency")) {
         scenario = SelfTest::Scenario::Latency;
+    } else if (parser.value(scenarioOption).toLower() == QStringLiteral("smoothfeel")) {
+        scenario = SelfTest::Scenario::SmoothFeel;
+    } else if (parser.value(scenarioOption).toLower() == QStringLiteral("startup")) {
+        scenario = SelfTest::Scenario::Startup;
     }
 
     QVulkanInstance vulkanInstance;

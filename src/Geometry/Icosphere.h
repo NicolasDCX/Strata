@@ -27,6 +27,15 @@ enum class VertexOrder {
     Generation,
 };
 
+/// Bump whenever the subdivision or the spatial ordering changes the output:
+/// it invalidates cached spheres (IcosphereCache.h).
+inline constexpr u32 kIcosphereGeneratorVersion = 1;
+
+/// The flat arrays makeIcosphere() builds its Mesh from: positions, and three
+/// vertex indices per triangle, both in their final order.
+void generateIcosphereArrays(int subdivisions, float radius, VertexOrder order, std::vector<glm::vec3>& positions,
+                             std::vector<u32>& indices);
+
 /// Sphere built by recursively subdividing an icosahedron and projecting the new
 /// vertices onto the sphere. Triangles are near-uniform and wound counter-clockwise
 /// when seen from outside. `subdivisions` is clamped to [0, kMaxIcosphereSubdivisions].

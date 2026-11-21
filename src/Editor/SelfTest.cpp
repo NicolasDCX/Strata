@@ -9,6 +9,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QFile>
+#include <QApplication>
 #include <QImage>
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -25,15 +26,122 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <numeric>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace se::editor {
 
 namespace {
+
+/// Sleeps until a steady_clock deadline with a high-resolution waitable timer
+/// on Windows (std::this_thread::sleep_until there wakes on the ~15.6 ms tick).
+class InputPacer {
+public:
+    InputPacer()
+    {
+#ifdef _WIN32
+        m_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+#endif
+    }
+    ~InputPacer()
+    {
+#ifdef _WIN32
+        if (m_timer != nullptr) {
+            CloseHandle(m_timer);
+        }
+#endif
+    }
+    InputPacer(const InputPacer&) = delete;
+    InputPacer& operator=(const InputPacer&) = delete;
+
+    void sleepUntil(std::chrono::steady_clock::time_point deadline)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (deadline <= now) {
+            return;
+        }
+#ifdef _WIN32
+        if (m_timer != nullptr) {
+            const auto ticks = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count() / 100;
+            LARGE_INTEGER due;
+            due.QuadPart = -static_cast<LONGLONG>(std::max<long long>(ticks, 1));
+            SetWaitableTimer(m_timer, &due, 0, nullptr, nullptr, FALSE);
+            WaitForSingleObject(m_timer, INFINITE);
+            return;
+        }
+#endif
+        std::this_thread::sleep_until(deadline);
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE m_timer = nullptr;
+#endif
+};
+
+/// A scripted pointer event of the latency scenario, posted to the viewport
+/// through Qt's event queue by the producer thread.
+class TracedPointerEvent final : public QEvent {
+public:
+    enum class Kind { Press, Move, Release };
+    TracedPointerEvent(Kind kind, int index, const QPointF& position, double scheduledMs)
+        : QEvent(eventType()), kind(kind), index(index), position(position), scheduledMs(scheduledMs)
+    {
+    }
+    static QEvent::Type eventType()
+    {
+        static const QEvent::Type type = static_cast<QEvent::Type>(QEvent::registerEventType());
+        return type;
+    }
+    Kind kind;
+    int index;
+    QPointF position;
+    double scheduledMs;
+    double postedMs = 0.0;
+};
+
+/// Intercepts TracedPointerEvents arriving at the viewport (on the GUI thread),
+/// and swallows and counts the window system's own mouse events meanwhile, so
+/// that only the scripted input reaches the stroke.
+class TracedPointerFilter final : public QObject {
+public:
+    explicit TracedPointerFilter(std::function<void(const TracedPointerEvent&)> handler) : m_handler(std::move(handler)) {}
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() == TracedPointerEvent::eventType()) {
+            m_handler(static_cast<const TracedPointerEvent&>(*event));
+            return true;
+        }
+        switch (event->type()) {
+        case QEvent::MouseMove:
+        case QEvent::MouseButtonPress:
+        case QEvent::MouseButtonRelease:
+        case QEvent::MouseButtonDblClick:
+            ++swallowed;
+            return true;
+        default:
+            return QObject::eventFilter(watched, event);
+        }
+    }
+    int swallowed = 0; ///< window-system mouse events kept from the viewport
+
+private:
+    std::function<void(const TracedPointerEvent&)> m_handler;
+};
 
 constexpr int kStepDelayMs = 120;
 constexpr int kExposeTimeoutMs = 10000;
@@ -263,6 +371,10 @@ void SelfTest::start()
         buildSmoothSteps();
     } else if (m_scenario == Scenario::Latency) {
         buildLatencySteps();
+    } else if (m_scenario == Scenario::SmoothFeel) {
+        buildSmoothFeelSteps();
+    } else if (m_scenario == Scenario::Startup) {
+        buildStartupSteps();
     } else {
         buildStandardSteps();
     }
@@ -1263,6 +1375,139 @@ void SelfTest::buildSmoothSteps()
     });
 }
 
+void SelfTest::buildStartupSteps()
+{
+    m_steps.push_back([this] {
+        const render::RenderStats& render = m_window.viewport().renderStats();
+        check(render.frameCount > 0, QStringLiteral("a frame was rendered"));
+        const app::StartupStats& startup = m_controller.startupStats();
+        const geo::IcosphereCacheStats& sphere = startup.sphere;
+        const char* source = sphere.source == geo::IcosphereSource::CacheLoaded    ? "loaded from cache"
+                             : sphere.source == geo::IcosphereSource::CacheCreated ? "generated, cache written"
+                                                                                   : "generated (no cache)";
+        const double mainEntryMs = qApp->property("se.mainEntryMs").toDouble();
+        const double readyMs = std::max(startup.readyProcessMs, render.firstFrameProcessMs);
+        note(QStringLiteral("sphere: %1 triangles, %2%3%4")
+                 .arg(m_controller.mesh().triangleCount())
+                 .arg(QString::fromLatin1(source))
+                 .arg(sphere.file.empty() ? QString() : QStringLiteral(" (%1)").arg(QString::fromStdWString(sphere.file.wstring())))
+                 .arg(sphere.rejected.empty() ? QString()
+                                              : QStringLiteral("; rejected existing file: %1").arg(QString::fromStdString(sphere.rejected))));
+        note(QStringLiteral("startup ms since launch: main %1, controller ready %2, renderer init start %3, first frame %4 = ready to sculpt %5")
+                 .arg(mainEntryMs, 0, 'f', 0).arg(startup.readyProcessMs, 0, 'f', 0)
+                 .arg(render.initResourcesStartProcessMs, 0, 'f', 0).arg(render.firstFrameProcessMs, 0, 'f', 0)
+                 .arg(readyMs, 0, 'f', 0));
+        note(QStringLiteral("controller ms: sphere %1 (generate %2, read %3, checksum %4, write %5, Mesh build %6), BVH %7; "
+                            "whole-mesh GPU upload %8; cache file %9 MiB")
+                 .arg(startup.meshMs, 0, 'f', 0).arg(sphere.generateMs, 0, 'f', 0).arg(sphere.readMs, 0, 'f', 0)
+                 .arg(sphere.checksumMs, 0, 'f', 0).arg(sphere.writeMs, 0, 'f', 0).arg(sphere.buildMs, 0, 'f', 0)
+                 .arg(startup.bvhMs, 0, 'f', 0).arg(render.initialUploadMs, 0, 'f', 0)
+                 .arg(static_cast<double>(sphere.fileBytes) / (1024.0 * 1024.0), 0, 'f', 1));
+        note(QStringLiteral("startup mesh hash %1").arg(meshHash(), 16, 16, QLatin1Char('0')));
+    });
+}
+
+void SelfTest::buildSmoothFeelSteps()
+{
+    // World-space strokes: rays along -Z through points of the front of the
+    // unit sphere, so the path, radius and strength are the same at every
+    // mesh level. The ridge runs along X at y = 0; Smooth covers its +X half.
+    const auto ray = [](float x, float y) { return geo::Ray{{x, y, 5.0f}, {0.0f, 0.0f, -1.0f}}; };
+    const auto run = [this, ray](sculpt::BrushId brush, float radius, float strength, float x0, float y0, float x1, float y1,
+                                 int samples) {
+        m_controller.setActiveBrush(brush);
+        m_controller.setRadius(radius);
+        m_controller.setStrength(strength);
+        check(m_controller.beginStroke(ray(x0, y0)), QStringLiteral("stroke starts on the mesh"));
+        for (int i = 1; i <= samples; ++i) {
+            const float t = static_cast<float>(i) / static_cast<float>(samples);
+            m_controller.updateStroke(ray(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t));
+        }
+        m_controller.endStroke();
+        m_controller.waitUntilIdle();
+    };
+    struct Light {
+        const char* name;
+        glm::vec3 direction;
+    };
+    // Grazing from above (across the ridge) and from the +X side (along it).
+    static const Light kLights[] = {{"above", glm::vec3(0.0f, 0.96f, 0.28f)}, {"side", glm::vec3(0.96f, 0.10f, 0.26f)}};
+    const auto captureAll = [this](const QString& stage) {
+        ViewportWindow& viewport = m_window.viewport();
+        render::OrbitCamera close;
+        close.set(glm::vec3(0.0f, -0.02f, 1.05f), 1.0f, 0.0f, 0.18f);
+        viewport.camera() = close;
+        for (const Light& light : kLights) {
+            viewport.setInspectionLight(light.direction);
+            capture(QStringLiteral("f_%1_%2.png").arg(stage, QString::fromLatin1(light.name)));
+        }
+        viewport.setInspectionLight(glm::vec3(0.0f));
+        capture(QStringLiteral("f_%1_editor.png").arg(stage));
+    };
+    // Crest profile: the highest vertex (distance from the centre) near
+    // (x, 0, z) on the front, every 0.05 along the ridge.
+    const auto profile = [this](const QString& stage) {
+        constexpr int kSamples = 27; // x = -0.65 .. 0.65
+        std::vector<float> peak(kSamples, 0.0f);
+        {
+            const std::scoped_lock lock(m_controller.documentMutex());
+            for (const glm::vec3& q : m_controller.mesh().positions()) {
+                if (q.z <= 0.3f || std::abs(q.y) > 0.06f) {
+                    continue;
+                }
+                const float slot = (q.x + 0.65f) / 0.05f;
+                const int i = static_cast<int>(std::lround(slot));
+                if (i >= 0 && i < kSamples && std::abs(slot - static_cast<float>(i)) * 0.05f < 0.012f) {
+                    peak[i] = std::max(peak[i], glm::length(q));
+                }
+            }
+        }
+        QString text = QStringLiteral("crest height (max |p| - 1, x = -0.65..0.65 step 0.05) %1:").arg(stage);
+        for (const float h : peak) {
+            text += QStringLiteral(" %1").arg(static_cast<double>(h - 1.0f), 0, 'f', 4);
+        }
+        note(text);
+    };
+
+    m_steps.push_back([this, captureAll] {
+        note(QStringLiteral("%1 triangles").arg(m_controller.mesh().triangleCount()));
+        captureAll(QStringLiteral("0_sphere"));
+    });
+    m_steps.push_back([this, run, captureAll, profile] {
+        // A broad ridge: one Draw pass along X (radius 0.3, strength 0.5).
+        run(sculpt::BrushId::Draw, 0.3f, 0.5f, -0.55f, 0.0f, 0.55f, 0.0f, 60);
+        // Small bumps on the crest: three single-point Draw strokes each.
+        for (const float x : {-0.45f, -0.3f, -0.15f, 0.0f, 0.15f, 0.3f, 0.45f}) {
+            for (int i = 0; i < 3; ++i) {
+                run(sculpt::BrushId::Draw, 0.08f, 0.5f, x, 0.0f, x, 0.0f, 0);
+            }
+        }
+        note(QStringLiteral("sculpted: %1 strokes").arg(m_controller.undoCount()));
+        profile(QStringLiteral("before Smooth"));
+        captureAll(QStringLiteral("1_before"));
+    });
+    // Smooth along the +X half of the ridge (radius 0.3, strength 0.5): one
+    // pass, then four more back and forth along the same path.
+    m_steps.push_back([this, run, captureAll, profile] {
+        sculpt::SmoothBrush::resetSteps(); // process-wide counters: this stroke only
+        run(sculpt::BrushId::Smooth, 0.3f, 0.5f, 0.12f, 0.0f, 0.62f, 0.0f, 40);
+        const sculpt::SmoothBrush::Steps steps = sculpt::SmoothBrush::steps();
+        note(QStringLiteral("Smooth pass 1: %1 dabs, %2 of %3 brush calls dense, %4 Laplacian passes")
+                 .arg(m_controller.stats().strokeDabCount).arg(steps.denseCalls).arg(steps.calls).arg(steps.laplacianPasses));
+        profile(QStringLiteral("after 1 Smooth pass"));
+        captureAll(QStringLiteral("2_smooth1"));
+    });
+    m_steps.push_back([this, run, captureAll, profile] {
+        for (int pass = 0; pass < 4; ++pass) {
+            const bool back = pass % 2 == 0;
+            run(sculpt::BrushId::Smooth, 0.3f, 0.5f, back ? 0.62f : 0.12f, 0.0f, back ? 0.12f : 0.62f, 0.0f, 40);
+        }
+        profile(QStringLiteral("after 5 Smooth passes"));
+        note(QStringLiteral("mesh hash %1").arg(meshHash(), 16, 16, QLatin1Char('0')));
+        captureAll(QStringLiteral("3_smooth5"));
+    });
+}
+
 void SelfTest::buildMoveSteps()
 {
     auto before = std::make_shared<std::vector<glm::vec3>>();
@@ -1460,41 +1705,80 @@ void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
         return centre + QPointF(circle * std::cos(angle), circle * std::sin(angle));
     };
 
+    // A producer thread posts the press, 240 moves and the release to the
+    // viewport through Qt's event queue on a 120 Hz schedule, so input does not
+    // depend on the GUI thread's timers. Times per input (0: the press):
+    // scheduled, posted (just before postEvent) and handled (when the GUI
+    // thread took it from the queue, before the viewport's pointer handler).
     struct State {
-        std::vector<double> intendedMs; // per input (0: the press)
-        std::vector<double> sentMs;
+        std::vector<double> scheduledMs;
+        std::vector<double> postedMs;
+        std::vector<double> handledMs;
+        int handledEvents = 0;
+        int outOfOrder = 0;
         double startMs = 0.0;
         double releaseMs = 0.0;
         double endAppliedMs = 0.0;
-        int nextMove = 1;
+        bool pressHit = false;
         std::size_t undoBefore = 0;
+        std::thread producer;
+        TracedPointerFilter* filter = nullptr;
     };
     auto state = std::make_shared<State>();
     state->undoBefore = m_controller.undoCount();
     viewport.setFrameSampling(true);
-    state->startMs = nowMs();
-    state->intendedMs.push_back(state->startMs);
-    state->sentMs.push_back(state->startMs);
-    viewport.pointerPress(pointAt(0), Qt::LeftButton, {});
 
+    state->filter = new TracedPointerFilter([this, state](const TracedPointerEvent& event) {
+        const double handled = std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+        ViewportWindow& view = m_window.viewport();
+        if (event.index != state->handledEvents) {
+            ++state->outOfOrder;
+        }
+        ++state->handledEvents;
+        switch (event.kind) {
+        case TracedPointerEvent::Kind::Press:
+            view.pointerPress(event.position, Qt::LeftButton, {});
+            state->pressHit = m_controller.strokeActive();
+            break;
+        case TracedPointerEvent::Kind::Move:
+            view.pointerMove(event.position);
+            break;
+        case TracedPointerEvent::Kind::Release:
+            view.pointerRelease();
+            state->releaseMs = handled;
+            return;
+        }
+        state->scheduledMs.push_back(event.scheduledMs);
+        state->postedMs.push_back(event.postedMs);
+        state->handledMs.push_back(handled);
+    });
+    viewport.installEventFilter(state->filter);
+
+    const Clock::time_point origin = Clock::now() + std::chrono::milliseconds(20);
+    state->startMs = std::chrono::duration<double, std::milli>(origin.time_since_epoch()).count();
+    state->producer = std::thread([target = static_cast<QObject*>(&viewport), origin, pointAt] {
+        InputPacer pacer;
+        for (int k = 0; k <= kMoves + 1; ++k) {
+            const Clock::time_point due =
+                origin + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(kIntervalMs * k));
+            pacer.sleepUntil(due);
+            const TracedPointerEvent::Kind kind = k == 0 ? TracedPointerEvent::Kind::Press
+                                                  : k <= kMoves ? TracedPointerEvent::Kind::Move
+                                                                : TracedPointerEvent::Kind::Release;
+            auto* event = new TracedPointerEvent(kind, k, pointAt(k < kMoves ? k : kMoves),
+                                                 std::chrono::duration<double, std::milli>(due.time_since_epoch()).count());
+            event->postedMs = std::chrono::duration<double, std::milli>(Clock::now().time_since_epoch()).count();
+            QCoreApplication::postEvent(target, event);
+        }
+    });
+
+    // Waits on the GUI thread (no input comes from here) for the release, the
+    // stroke's end and a tail of frames.
     auto* timer = new QTimer(this);
     timer->setTimerType(Qt::PreciseTimer);
-    connect(timer, &QTimer::timeout, this, [this, timer, state, pointAt, nowMs, name, circle] {
+    connect(timer, &QTimer::timeout, this, [this, timer, state, nowMs, name, circle] {
         ViewportWindow& view = m_window.viewport();
-        // Inputs due by now are sent in order (a late GUI thread gets them as a burst, as from the OS queue).
-        while (state->nextMove <= kMoves) {
-            const double due = state->startMs + kIntervalMs * state->nextMove;
-            if (nowMs() < due) {
-                return;
-            }
-            state->intendedMs.push_back(due);
-            state->sentMs.push_back(nowMs());
-            view.pointerMove(pointAt(state->nextMove));
-            ++state->nextMove;
-        }
         if (state->releaseMs == 0.0) {
-            state->releaseMs = nowMs();
-            view.pointerRelease();
             return;
         }
         if (state->endAppliedMs == 0.0) {
@@ -1508,15 +1792,26 @@ void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
         }
         timer->stop();
         timer->deleteLater();
+        state->producer.join();
+        view.removeEventFilter(state->filter);
+        const int swallowed = state->filter->swallowed;
+        delete state->filter;
+        state->filter = nullptr;
         m_controller.waitUntilIdle();
         view.setFrameSampling(false);
+        const u64 strokeHash = meshHash();
 
         const app::InteractionStats stats = m_controller.stats();
         const render::RenderStats& render = view.renderStats();
         const std::vector<render::FrameTrace>& frames = render.frameTraces;
         const double t0 = state->startMs;
-        check(stats.inputSamples.size() == state->sentMs.size(),
-              QStringLiteral("%1 trace: one input sample per sent input (%2 of %3)").arg(name).arg(stats.inputSamples.size()).arg(state->sentMs.size()));
+        check(state->pressHit, QStringLiteral("%1 trace: the press started a stroke").arg(name));
+        check(state->handledEvents == kMoves + 2 && state->outOfOrder == 0,
+              QStringLiteral("%1 trace: every posted event handled once, in order (%2 of %3, %4 out of order)")
+                  .arg(name).arg(state->handledEvents).arg(kMoves + 2).arg(state->outOfOrder));
+        check(stats.inputSamples.size() == state->postedMs.size() && state->postedMs.size() == static_cast<std::size_t>(kMoves + 1),
+              QStringLiteral("%1 trace: one input sample per posted press and move (%2 samples, %3 posted)")
+                  .arg(name).arg(stats.inputSamples.size()).arg(state->postedMs.size()));
 
         // For each input with dabs: the first frame that took its last dab's
         // commit and drew every visible page current.
@@ -1524,6 +1819,9 @@ void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
         std::vector<double> toConsume;
         std::vector<double> toSubmit;
         std::vector<double> total;
+        std::vector<double> postToHandler;
+        std::vector<double> postToSubmit;
+        std::vector<double> scheduleToPost;
         u32 measured = 0;
         u32 dabInputs = 0;
         u32 olderFramesAfterCommit = 0; // frames submitted after the commit that still had older geometry
@@ -1531,9 +1829,9 @@ void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
         QFile file(path);
         const bool opened = file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text);
         QTextStream out(&file);
-        out << "kind,index,intended_ms,sent_ms,queued_ms,started_ms,done_ms,dabs,commit_seq,committed_ms,frame\n";
+        out << "kind,index,scheduled_ms,posted_ms,handled_ms,queued_ms,started_ms,done_ms,dabs,commit_seq,committed_ms,frame\n";
         std::size_t frameCursor = 0;
-        for (std::size_t i = 0; i < stats.inputSamples.size() && i < state->sentMs.size(); ++i) {
+        for (std::size_t i = 0; i < stats.inputSamples.size() && i < state->postedMs.size(); ++i) {
             const auto& s = stats.inputSamples[i];
             long long frameIndex = -1;
             if (s.dabs > 0) {
@@ -1550,6 +1848,9 @@ void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
                     toConsume.push_back(f.consumedMs - s.committedAtMs);
                     toSubmit.push_back(f.submittedMs - s.committedAtMs);
                     total.push_back(f.submittedMs - s.queuedAtMs);
+                    postToHandler.push_back(state->handledMs[i] - state->postedMs[i]);
+                    postToSubmit.push_back(f.submittedMs - state->postedMs[i]);
+                    scheduleToPost.push_back(state->postedMs[i] - state->scheduledMs[i]);
                     for (std::size_t k = 0; k < frameCursor; ++k) {
                         if (frames[k].submittedMs > s.committedAtMs && frames[k].commitSeq < s.commitSeq) {
                             ++olderFramesAfterCommit;
@@ -1557,8 +1858,9 @@ void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
                     }
                 }
             }
-            out << "input," << i << ',' << QString::number(state->intendedMs[i] - t0, 'f', 4) << ','
-                << QString::number(state->sentMs[i] - t0, 'f', 4) << ',' << QString::number(s.queuedAtMs - t0, 'f', 4) << ','
+            out << "input," << i << ',' << QString::number(state->scheduledMs[i] - t0, 'f', 4) << ','
+                << QString::number(state->postedMs[i] - t0, 'f', 4) << ',' << QString::number(state->handledMs[i] - t0, 'f', 4) << ','
+                << QString::number(s.queuedAtMs - t0, 'f', 4) << ','
                 << QString::number(s.startedAtMs - t0, 'f', 4) << ',' << QString::number(s.doneAtMs - t0, 'f', 4) << ',' << s.dabs << ','
                 << s.commitSeq << ',' << (s.dabs > 0 ? QString::number(s.committedAtMs - t0, 'f', 4) : QString()) << ',' << frameIndex << '\n';
         }
@@ -1590,7 +1892,13 @@ void SelfTest::runLatencyTrace(sculpt::BrushId brush, const QString& name)
                  .arg(name).arg(static_cast<double>(kRadius)).arg(circle, 0, 'f', 0).arg(stats.inputSamples.size())
                  .arg(dabInputs).arg(measured).arg(frames.size()).arg(olderFramesAfterCommit));
         note(QStringLiteral("  ms: %1 | %2 | %3 | %4").arg(row("queued->commit", toCommit), row("commit->frame took it", toConsume),
-                                                          row("commit->submit+present request", toSubmit), row("queued->submit", total)));
+                                                          row("commit->submission", toSubmit), row("queued->submission", total)));
+        note(QStringLiteral("  dab inputs, ms: %1 | %2 | %3 (submission: frameReady() returned, queue submit and present request issued)")
+                 .arg(row("scheduled->posted (producer jitter)", scheduleToPost), row("posted->GUI handler", postToHandler),
+                      row("posted->submission", postToSubmit)));
+        note(QStringLiteral("  %1 stroke mesh hash %2 (frame-on-commit %3); %4 window-system mouse events kept from the viewport during the stroke")
+                 .arg(name).arg(strokeHash, 16, 16, QLatin1Char('0'))
+                 .arg(m_window.viewport().frameOnEngineChange() ? QStringLiteral("on") : QStringLiteral("off")).arg(swallowed));
         {
             const sculpt::StrokeStats& st = stats.strokeStages;
             const double n = std::max<u32>(st.dabCount, 1u);

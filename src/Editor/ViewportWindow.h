@@ -60,6 +60,7 @@ public:
     /// (an UpdateRequest sent directly), instead of requestUpdate(), which Qt
     /// delivers from a timer. Off (default): requestUpdate().
     void setFrameOnEngineChange(bool enabled) noexcept { m_frameOnEngineChange = enabled; }
+    [[nodiscard]] bool frameOnEngineChange() const noexcept { return m_frameOnEngineChange; }
     /// Measurement only: draws the scene this many times per frame (RenderSettings::drawRepeat).
     void setDrawRepeat(u32 repeat) { m_scene.settings.drawRepeat = repeat; }
     /// PROTOTYPE seam test: 0 off, 1 odd chunks coarse, 2 all chunks coarse (RenderSettings::coarseDebug).
@@ -67,6 +68,13 @@ public:
     void setCoarseDebug(u32 mode)
     {
         m_scene.settings.coarseDebug = mode;
+        requestUpdate();
+    }
+    /// Test support: a single world-space light for shading inspection, or
+    /// zero for the editor's lighting (RenderSettings::inspectionLight).
+    void setInspectionLight(const glm::vec3& direction)
+    {
+        m_scene.settings.inspectionLight = direction;
         requestUpdate();
     }
     /// Test support: hides the brush cursor without changing its position or radius.

@@ -6,6 +6,7 @@ se_add_test(se_geometry_tests
     CoreTests.cpp
     DerivedNeighborsTests.cpp
     EditRegionTests.cpp
+    IcosphereCacheTests.cpp
     IcosphereTests.cpp
     IntersectTests.cpp
     MeshTests.cpp

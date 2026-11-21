@@ -13,6 +13,8 @@ add_library(se_geometry STATIC
     EditRegion.h
     Icosphere.cpp
     Icosphere.h
+    IcosphereCache.cpp
+    IcosphereCache.h
     Intersect.cpp
     Intersect.h
     Mesh.h

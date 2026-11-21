@@ -16,6 +16,7 @@ namespace {
 SmoothBrush::Steps g_steps;
 std::atomic<bool> g_parallelBinning{true};
 std::atomic<bool> g_quadraticKernel{true};
+std::atomic<float> g_denseThreshold{SmoothBrush::kDenseVerticesPerCell};
 
 /// Uniform grid over the brush sphere used by the dense-mode filter.
 /// Storage lives in DabScratch: vectors[cell] = sum of positions,
@@ -352,6 +353,16 @@ bool SmoothBrush::quadraticKernel() noexcept
     return g_quadraticKernel.load(std::memory_order_relaxed);
 }
 
+void SmoothBrush::setDenseThreshold(float verticesPerCell) noexcept
+{
+    g_denseThreshold.store(verticesPerCell, std::memory_order_relaxed);
+}
+
+float SmoothBrush::denseThreshold() noexcept
+{
+    return g_denseThreshold.load(std::memory_order_relaxed);
+}
+
 void SmoothBrush::apply(const DabContext& ctx) const
 {
     if (ctx.vertices.empty() || ctx.radius <= 0.0f) {
@@ -361,7 +372,7 @@ void SmoothBrush::apply(const DabContext& ctx) const
 
     ++g_steps.calls;
     KernelGrid grid;
-    if (buildKernelGrid(ctx, grid) >= kDenseVerticesPerCell) {
+    if (buildKernelGrid(ctx, grid) >= g_denseThreshold.load(std::memory_order_relaxed)) {
         ++g_steps.denseCalls;
         kernelPass(ctx, grid, std::min(1.0f, strength * 2.0f));
         laplacianPasses(ctx, strength);

@@ -15,7 +15,7 @@ struct MeshFrameConstants {
     glm::vec4 eyePosition{0.0f};
     glm::vec4 brushSphere{0.0f}; // xyz centre, w radius (<= 0: hidden)
     glm::vec4 brushColor{0.0f};
-    glm::uvec4 params{0u};       // x: log2 of the GPU vertex page size
+    glm::uvec4 params{0u};       // x: log2 of the GPU vertex page size; yzw: inspection light bits (0: off)
 };
 // 128 bytes is the minimum push constant size every Vulkan implementation supports.
 static_assert(sizeof(MeshFrameConstants) == 128, "push constant block layout changed");

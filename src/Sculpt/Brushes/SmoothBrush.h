@@ -26,8 +26,13 @@ public:
     static constexpr int kMaxPassesPerDab = 4;
     /// Kernel cell size of the dense-mode filter, as a fraction of the brush radius.
     static constexpr float kKernelFraction = 0.3f;
-    /// Average vertices per occupied kernel cell from which a region counts as dense.
-    static constexpr float kDenseVerticesPerCell = 12.0f;
+    /// Average vertices per occupied kernel cell from which a region counts as
+    /// dense. Below it a dab falls back to Laplacian passes, whose reach is a
+    /// few edges rather than a fraction of the radius, so it smooths much less.
+    /// At 12 (the former value) the default mesh sat on the switch at the
+    /// editor's radii and smoothed about half as much per pass as denser
+    /// meshes; the quadratic kernel stays clean down to about 3 per cell.
+    static constexpr float kDenseVerticesPerCell = 4.0f;
     /// With helper threads, dabs of at least this many vertices bin them in
     /// parallel: each cell still sums its vertices in the order of the list.
     static constexpr std::size_t kParallelBinMinVertices = 32768;
@@ -46,6 +51,11 @@ public:
     /// bands. A process-wide switch for comparisons.
     static void setQuadraticKernel(bool enabled) noexcept;
     [[nodiscard]] static bool quadraticKernel() noexcept;
+    /// Average vertices per occupied kernel cell from which a dab uses the
+    /// dense-mode filter (default kDenseVerticesPerCell). A process-wide
+    /// switch for comparisons.
+    static void setDenseThreshold(float verticesPerCell) noexcept;
+    [[nodiscard]] static float denseThreshold() noexcept;
 
     [[nodiscard]] std::string_view name() const noexcept override { return "Smooth"; }
     [[nodiscard]] StrokeMode mode() const noexcept override { return StrokeMode::Dabs; }

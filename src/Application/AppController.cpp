@@ -1,6 +1,7 @@
 #include "Application/AppController.h"
 
 #include "Core/Log.h"
+#include "Core/ProcessClock.h"
 #include "Core/Timer.h"
 #include "Geometry/Icosphere.h"
 #include "Sculpt/Brushes/SmoothBrush.h"
@@ -23,11 +24,23 @@ constexpr u32 kOptimizeStepTriangles = 4096;
 /// 4,096 triangles take about 0.25 ms on one thread).
 constexpr u32 kConeRebuildChunksPerThread = 4;
 
-geo::ChunkedBvh buildBvh(const geo::Mesh& mesh, u32 chunkTriangleShift, core::JobSystem* jobs, bool normalCones)
+geo::ChunkedBvh buildBvh(const geo::Mesh& mesh, u32 chunkTriangleShift, core::JobSystem* jobs, bool normalCones,
+                         StartupStats& startup)
 {
+    const core::Stopwatch timer;
     geo::ChunkedBvh bvh;
     bvh.build(mesh, chunkTriangleShift, jobs, normalCones);
+    startup.bvhMs = timer.elapsedMs();
     return bvh;
+}
+
+geo::Mesh makeSphere(const AppConfig& config, StartupStats& startup)
+{
+    const core::Stopwatch timer;
+    geo::Mesh mesh = geo::makeIcosphereCached(config.sphereCacheDirectory, config.sphereSubdivisions, config.sphereRadius,
+                                              geo::VertexOrder::Spatial, config.meshLayout, &startup.sphere);
+    startup.meshMs = timer.elapsedMs();
+    return mesh;
 }
 
 std::unique_ptr<core::JobSystem> makeJobSystem(int requestedThreads)
@@ -41,12 +54,12 @@ std::unique_ptr<core::JobSystem> makeJobSystem(int requestedThreads)
 
 AppController::AppController(const AppConfig& config)
     : m_jobs(makeJobSystem(config.jobThreads)),
-      m_mesh(geo::makeIcosphere(config.sphereSubdivisions, config.sphereRadius, geo::VertexOrder::Spatial,
-                                config.meshLayout)),
-      m_bvh(buildBvh(m_mesh, config.chunkTriangleShift, m_jobs.get(), config.normalCones)),
+      m_mesh(makeSphere(config, m_startup)),
+      m_bvh(buildBvh(m_mesh, config.chunkTriangleShift, m_jobs.get(), config.normalCones, m_startup)),
       m_stroke(m_mesh, m_bvh),
       m_dirty(m_mesh.makeDirtySet())
 {
+    m_startup.readyProcessMs = core::processUptimeMs();
     m_stroke.setJobSystem(m_jobs.get());
     m_stroke.setParallelGather(config.parallelGather);
     m_stroke.setParallelMarking(config.parallelMarking);

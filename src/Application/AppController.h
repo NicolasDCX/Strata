@@ -5,6 +5,7 @@
 #include "Core/Timer.h"
 #include "Geometry/ChunkedBvh.h"
 #include "Geometry/DirtyVertexSet.h"
+#include "Geometry/IcosphereCache.h"
 #include "Geometry/Mesh.h"
 #include "Geometry/Ray.h"
 #include "Sculpt/BrushLibrary.h"
@@ -14,6 +15,7 @@
 
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -24,10 +26,22 @@
 
 namespace se::app {
 
+/// Where the controller's construction spent its time.
+struct StartupStats {
+    geo::IcosphereCacheStats sphere; ///< how the mesh was obtained, and its stages
+    double meshMs = 0.0;             ///< sphere generated or loaded, and the Mesh built
+    double bvhMs = 0.0;              ///< BVH (with normal cones) built
+    double readyProcessMs = 0.0;     ///< process uptime when the controller was constructed
+};
+
 struct AppConfig {
     /// Icosphere subdivision level: 20 * 4^n triangles (6 -> 81,920, 7 -> 327,680).
     int sphereSubdivisions = 6;
     float sphereRadius = 1.0f;
+    /// Optional cache of the pristine sphere (geo::makeIcosphereCached): load it
+    /// from this directory if a valid file exists, else generate it and write
+    /// the file. Empty (default): generate without caching. Same mesh either way.
+    std::filesystem::path sphereCacheDirectory;
     /// Threads helping the sculpt thread with per-vertex loops.
     /// Negative: choose from the hardware. 0: none (dabs run on the sculpt thread only).
     int jobThreads = -1;
@@ -234,6 +248,8 @@ public:
     /// time. Positions and normals may only be read while holding documentMutex()
     /// or after waitUntilIdle() with no further input.
     [[nodiscard]] const geo::Mesh& mesh() const noexcept { return m_mesh; }
+    /// Where construction spent its time (sphere cache, mesh, BVH).
+    [[nodiscard]] const StartupStats& startupStats() const noexcept { return m_startup; }
 
     /// Protects the mesh's vertex data, the BVH and pendingVertexUpdates().
     [[nodiscard]] core::FairMutex& documentMutex() const noexcept { return m_documentMutex; }
@@ -375,6 +391,7 @@ private:
     // Declared first: the acceleration structure is built with it, and it must
     // outlive everything that may still be running jobs.
     std::unique_ptr<core::JobSystem> m_jobs;
+    StartupStats m_startup; // filled while m_mesh and m_bvh are built below
 
     // --- Document: guarded by m_documentMutex --------------------------------
     mutable core::FairMutex m_documentMutex;

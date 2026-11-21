@@ -56,3 +56,7 @@ __pycache__/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Pristine-sphere cache (--sphere-cache / se_bench cache=DIR): large generated binaries
+cache/
+*.bin.partial

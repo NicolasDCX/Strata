@@ -196,6 +196,8 @@ public:
     [[nodiscard]] std::size_t brushScratchBytes() const noexcept { return m_scratch.memoryBytes(); }
     /// The part of editScratchBytes() only the parallel gather uses.
     [[nodiscard]] std::size_t parallelGatherScratchBytes() const noexcept;
+    /// The part of parallelGatherScratchBytes() held by the blocks' candidate lists.
+    [[nodiscard]] std::size_t gatherCandidateBytes() const noexcept;
 
     /// Brush centre of the most recent edit (valid while a stroke is active).
     [[nodiscard]] glm::vec3 lastCenter() const noexcept { return m_lastCenter; }
@@ -279,6 +281,10 @@ private:
         std::vector<u32> inside;   // first occurrences inside the sphere, in order
         std::vector<float> weights;
         std::vector<u32> outside;  // first occurrences outside (only to reset their slot)
+        // Vertices whose first-corner slot this block lowered, with that corner,
+        // in corner order: a superset of the block's first occurrences.
+        std::vector<u32> candidates;
+        std::vector<u32> candidateCorners;
     };
     std::vector<GatherBlock> m_blocks;
     geo::EditRegion m_region; // per dab: affected triangles and vertices, shared by normals and BVH

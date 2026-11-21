@@ -67,6 +67,17 @@ public:
         /// to its dab's commit and to the first frame that took that commit's
         /// updates; writes trace_<brush>.csv.
         Latency,
+        /// Smooth on a sculpted surface: a broad Draw ridge with small bumps on
+        /// its crest (world-space rays, fixed radius and strength, so the same
+        /// stroke at every mesh level), then Smooth along one half of it.
+        /// Captures fixed close-ups under grazing light before, after one Smooth
+        /// pass and after five, and notes a crest height profile.
+        SmoothFeel,
+        /// Startup timings: process launch to main(), controller ready (sphere
+        /// generated or loaded from --sphere-cache, mesh built, BVH built),
+        /// first frame submitted; the sphere cache's stages and the startup
+        /// mesh hash. Then exits.
+        Startup,
     };
 
     SelfTest(MainWindow& window, app::AppController& controller, const QString& outputDirectory,
@@ -103,6 +114,8 @@ private:
     void buildHistorySteps();
     void buildMoveSteps();
     void buildSmoothSteps();
+    void buildSmoothFeelSteps();
+    void buildStartupSteps();
     void buildLatencySteps();
     /// One traced stroke of the Latency scenario; undone afterwards.
     void runLatencyTrace(sculpt::BrushId brush, const QString& name);

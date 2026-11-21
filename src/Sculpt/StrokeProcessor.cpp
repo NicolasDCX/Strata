@@ -55,6 +55,15 @@ std::size_t StrokeProcessor::editScratchBytes() const noexcept
            m_bvh.markScratchBytes();
 }
 
+std::size_t StrokeProcessor::gatherCandidateBytes() const noexcept
+{
+    std::size_t bytes = 0;
+    for (const GatherBlock& block : m_blocks) {
+        bytes += (block.candidates.capacity() + block.candidateCorners.capacity()) * sizeof(u32);
+    }
+    return bytes;
+}
+
 std::size_t StrokeProcessor::parallelGatherScratchBytes() const noexcept
 {
     std::size_t bytes = m_queryChunks.capacity() * sizeof(u32) + m_offsets.capacity() * sizeof(std::size_t) +
@@ -64,7 +73,8 @@ std::size_t StrokeProcessor::parallelGatherScratchBytes() const noexcept
         bytes += triangles.capacity() * sizeof(u32);
     }
     for (const GatherBlock& block : m_blocks) {
-        bytes += (block.inside.capacity() + block.outside.capacity()) * sizeof(u32) +
+        bytes += (block.inside.capacity() + block.outside.capacity() + block.candidates.capacity() +
+                  block.candidateCorners.capacity()) * sizeof(u32) +
                  block.weights.capacity() * sizeof(float);
     }
     return bytes;
@@ -306,26 +316,11 @@ void StrokeProcessor::gatherParallel(const glm::vec3& center, float radius)
     // 2. Every vertex's first corner in the triangle list (corner k of
     //    triangle t is 3t + k). The serial gather tests a vertex there and
     //    nowhere else, so selecting first corners gives its list and order.
+    //    Block by block: a block that lowers a vertex's slot keeps it as a
+    //    candidate, with the corner. Within a block corners only grow, so it
+    //    lowers each slot at most once and its candidates are in corner order;
+    //    the block holding a vertex's first corner always keeps it.
     const std::size_t triangleCount = m_triangles.size();
-    core::parallelFor(m_jobs, triangleCount, 4096, [&](std::size_t begin, std::size_t end) {
-        for (std::size_t t = begin; t < end; ++t) {
-            const auto& corners = m_mesh.triangle(m_triangles[t]);
-            for (u32 c = 0; c < 3; ++c) {
-                const u32 corner = static_cast<u32>(3 * t + c);
-                std::atomic_ref<u32> first(m_gatherStamp[corners[c]]);
-                u32 current = first.load(std::memory_order_relaxed);
-                while (corner < current && !first.compare_exchange_weak(current, corner, std::memory_order_relaxed)) {
-                }
-            }
-        }
-    });
-
-    m_stats.gather.selectFirstMs += step.elapsedMs();
-    step.reset();
-    // 3. Test the first occurrences, block by block, then join the blocks in order.
-    const auto positions = m_mesh.positions();
-    const float radiusSquared = radius * radius;
-    const float invRadiusSquared = 1.0f / radiusSquared;
     const std::size_t blockCount = (triangleCount + kGatherBlockTriangles - 1) / kGatherBlockTriangles;
     if (m_blocks.size() < blockCount) {
         m_blocks.resize(blockCount);
@@ -333,25 +328,53 @@ void StrokeProcessor::gatherParallel(const glm::vec3& center, float radius)
     core::parallelFor(m_jobs, blockCount, 1, [&](std::size_t begin, std::size_t end) {
         for (std::size_t b = begin; b < end; ++b) {
             GatherBlock& block = m_blocks[b];
-            block.inside.clear();
-            block.weights.clear();
-            block.outside.clear();
+            block.candidates.clear();
+            block.candidateCorners.clear();
             const std::size_t last = std::min(triangleCount, (b + 1) * kGatherBlockTriangles);
             for (std::size_t t = b * kGatherBlockTriangles; t < last; ++t) {
                 const auto& corners = m_mesh.triangle(m_triangles[t]);
                 for (u32 c = 0; c < 3; ++c) {
-                    const u32 vertex = corners[c];
-                    if (m_gatherStamp[vertex] != static_cast<u32>(3 * t + c)) {
-                        continue; // not this vertex's first corner
+                    const u32 corner = static_cast<u32>(3 * t + c);
+                    std::atomic_ref<u32> first(m_gatherStamp[corners[c]]);
+                    u32 current = first.load(std::memory_order_relaxed);
+                    while (corner < current) {
+                        if (first.compare_exchange_weak(current, corner, std::memory_order_relaxed)) {
+                            block.candidates.push_back(corners[c]);
+                            block.candidateCorners.push_back(corner);
+                            break;
+                        }
                     }
-                    const glm::vec3 offset = positions[vertex] - center;
-                    const float distanceSquared = glm::dot(offset, offset);
-                    if (distanceSquared < radiusSquared) {
-                        block.inside.push_back(vertex);
-                        block.weights.push_back(smoothFalloff(distanceSquared * invRadiusSquared));
-                    } else {
-                        block.outside.push_back(vertex);
-                    }
+                }
+            }
+        }
+    });
+
+    m_stats.gather.selectFirstMs += step.elapsedMs();
+    step.reset();
+    // 3. Test each block's candidates that still hold their slot (the first
+    //    occurrences), in corner order, then join the blocks in order.
+    const auto positions = m_mesh.positions();
+    const float radiusSquared = radius * radius;
+    const float invRadiusSquared = 1.0f / radiusSquared;
+    core::parallelFor(m_jobs, blockCount, 1, [&](std::size_t begin, std::size_t end) {
+        for (std::size_t b = begin; b < end; ++b) {
+            GatherBlock& block = m_blocks[b];
+            block.inside.clear();
+            block.weights.clear();
+            block.outside.clear();
+            const std::size_t count = block.candidates.size();
+            for (std::size_t i = 0; i < count; ++i) {
+                const u32 vertex = block.candidates[i];
+                if (m_gatherStamp[vertex] != block.candidateCorners[i]) {
+                    continue; // an earlier block holds this vertex's first corner
+                }
+                const glm::vec3 offset = positions[vertex] - center;
+                const float distanceSquared = glm::dot(offset, offset);
+                if (distanceSquared < radiusSquared) {
+                    block.inside.push_back(vertex);
+                    block.weights.push_back(smoothFalloff(distanceSquared * invRadiusSquared));
+                } else {
+                    block.outside.push_back(vertex);
                 }
             }
         }
